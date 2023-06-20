@@ -1,0 +1,3363 @@
+---
+title: WW TSA
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: true
+      smooth_scroll: false
+    number_sections: yes
+    code_folding: hide
+    fig_caption: no
+    fig_width: 8
+    fig_height: 3.1
+    mathjax: null
+    theme: united
+    df_print: kable
+    dev: png
+    highlight: kate
+editor_options: 
+  chunk_output_type: console
+---
+
+# Set up
+
+```{r setup, message = FALSE}
+knitr::opts_chunk$set(message = FALSE, echo = TRUE)
+here::i_am("R/tsa/tsa.Rmd", uuid = "f500c781-3a67-4f35-85e0-bffca3ec75fd")
+library(here)
+library(magrittr)
+library(patchwork)
+library(fable)
+library(performance)
+
+# This runs a setup script. It should automatically install any extra packages
+# you need.
+source(here("R/00_setup.R"), encoding = 'UTF-8')
+
+# Flexible lag function that also allows negative numbers.
+shift <- function(x, n) {
+  assert_that(is.number(n))
+  
+  if (n == 0) return(x)
+  
+  if (n >= 1) return(dplyr::lag(x, n))
+  
+  if (n <= -1) return(dplyr::lead(x, abs(n)))
+}
+
+# Function that lets you add multiple lags in one go
+lag_multiple <- function(x, n_vec) {
+  x_name = deparse(substitute(x))
+  map(n_vec, shift, x = x) %>%
+    set_names(paste0(x_name, "_lag_", n_vec)) %>%
+    as_tibble()
+}
+
+# Function to show observed vs predicted
+plot_orange <- function(df, yvar, title = NULL, ci = TRUE) {
+  layer_ci <- if (ci) {
+    geom_ribbon(aes(ymin = .lower,
+                    ymax = .upper),
+                fill = "darkorange",
+                alpha = 0.15)
+  } else {
+    NULL
+  }
+    
+  df %>%
+    ggplot(aes(date_receipt)) +
+    geom_line(aes(y = log10({{yvar}}),
+                  colour = "Observed"),
+              linewidth = 2.5) +
+    layer_ci +
+    geom_point(aes(y = .fitted,
+                   colour = "Predicted"),
+               size = 3) +
+    expand_limits(y = 0) +
+    scale_x_date(date_breaks = "1 month",
+                 date_labels = "%b") +
+    scale_colour_manual(breaks = c("Observed", "Predicted"),
+                        values = c("grey85", "darkorange")) +
+    labs(title = title,
+         x = NULL,
+         y = "Log incidence",
+         colour = NULL)
+}
+
+filter_studyperiod <- function(df, date_col = date_receipt) {
+  df %>% 
+    filter({{date_col}} >= ymd("2021-09-27"),
+           {{date_col}} <= ymd("2022-06-26"))
+}
+
+filter_analysis <- function(df, log = FALSE) {
+  
+  filter2 <- if (log) tidylog::filter else dplyr::filter
+  
+  if (log) print(nrow(df))
+  
+  df <- df %>% 
+    filter_studyperiod() %>% 
+    filter(!is.na(rna_mean),
+           overlap_level == "1. anlæg")
+  
+  if (log) print(nrow(df))
+  
+  df %>% 
+    filter2(!is.na(population)) %>% 
+    filter2(wday(date_receipt, week_start = 1) %in% c(2, 3, 5)) %>% 
+    filter2(!is.na(flow)) %>% 
+    # Get rid of non-Tue/Wed/Fri WW measurements
+    filter2(proevetagnings_metode %in% c("Mgd.prop.",
+                                        "Tid.prop."))
+}
+
+
+summary_copies_per_person <- function(df) {
+
+  df %>%
+    filter(!is.na(rna_mean),
+           !is.na(flow),
+           !is.na(population),
+           flow > 200 | anlaeg_rando != "København (Lynetten)",
+           !anlaeg_rando %in% c("Avedøre (Ejby)",
+                                "Avedøre (Vallensbæk)")) %>%
+    mutate(copies_per_person = (rna_mean * flow) / population) %>%
+    summarise(pop_ww = sum(population),
+              weighted_t_test = list(suppressWarnings(
+                weights::wtd.t.test(copies_per_person, NA, weight = population)
+              )),
+              copies_per_person = weighted_t_test[[1]]$additional["Mean"],
+              se = weighted_t_test[[1]]$additional["Std. Err"],
+              ci_lo = copies_per_person - 1.96 * se,
+              ci_hi = copies_per_person + 1.96 * se,
+              .groups = "drop") %>%
+    ungroup() %>%
+    select(-weighted_t_test)
+
+}
+
+label_month_first_year <- function(x, month_format = "%b",
+                                   month_year_format = "%b\n%Y") {
+  function(x,
+           fmt_m = month_format,
+           fmt_my = month_year_format) {
+    if_else(month(x) == 1,
+            format.Date(x, format = fmt_my),
+            format.Date(x, format = fmt_m))
+  }
+}
+```
+
+Read data
+
+```{r read_data}
+load(here("R/tsa/tsa_data.RData"))
+load(here("R/tsa/2023-04-21 1343.RData"))
+```
+
+
+```{r}
+# TODO: move this into better place
+
+# Alternative, using data DIAS extracted for me:
+
+# raw_subnational_human <- read_csv_dk("//s-inf-fil-05-p.ssi.ad/svl/Dias/Projekter/SARS2/SARS2_ESRI/Spildevandsprojekt/outputs/sas_outputs/Oliver_artikel_jirasag_4028/covidpos_testede_pr_dag_geo_15JUN22.csv")
+#
+# raw_subnational_human %>%
+#   filter(gruppe == "Regionalt") %>%
+#   mutate(date = dmy(dato),
+#          monday = floor_monday(date)) %>%
+#   group_by(location, monday) %>%
+#   summarise(cases = sum(covid_cases),
+#             tests = sum(testede_pers),
+#             n_days = n(),
+#             .groups = "drop") %>%
+#   filter(n_days == 7) %>%
+#   print() %>%
+#   ggplot(aes(monday, cases, colour = location)) +
+#   geom_line() +
+#   scale_y_log10()
+
+
+
+
+
+
+regional_population <- raw_regional_population %>%
+  filter(str_detect(area, "Region")) %>%
+  mutate(region = str_remove(area, "Region ")) %>%
+  select(region, population)
+
+
+
+
+regional_cases <- raw_regional_cases %>%
+  select(date = Dato,
+         region = Region,
+         new_cases = `Bekræftede tilfælde i alt`) %>%
+  mutate(monday = floor_monday(date)) %>%
+  filter(monday >= ymd("2021-06-01")) %>%
+  group_by(region, monday) %>%
+  summarise(new_cases = sum(new_cases),
+            n_days = n()) %>%
+  ungroup() %>%
+  filter(n_days == 7) %>%
+  select(-n_days)
+
+
+
+
+regional_tests <- raw_regional_tests %>%
+  mutate(monday = Uge %>%
+           str_replace("U(\\d\\d)", "W\\1-1") %>%
+           ISOweek2date()) %>%
+  filter(Metode == "PCR",
+         !is.na(Region),
+         monday >= ymd("2021-06-01")) %>%
+  select(monday,
+         region = Region,
+         tests = Prøver) %>%
+  arrange(monday, region)
+
+
+regional_human <- regional_cases %>%
+  left_join(regional_tests,
+             by = c("region", "monday")) %>%
+  left_join(regional_population, by = c("region")) %>%
+  mutate(incidence = new_cases / population * 1e5,
+         new_tests_per_thousand = tests / population * 1e3)
+
+dk_human <- regional_human %>% 
+  group_by(monday) %>% 
+  summarise(new_cases = sum(new_cases),
+            tests = sum(tests),
+            population = sum(regional_population$population)) %>% 
+  mutate(incidence = new_cases / population * 100000,
+         new_tests_per_thousand = tests / population * 1000)
+```
+
+
+
+
+
+Clean data.
+
+```{r clean_pleje}
+pleje <- raw_pleje %>% 
+  filter(branche_txt1 %in% c("Plejehjem", "Hjemmehjælp"),
+         Uge >= 202126) %>% 
+  group_by(Uge) %>% 
+  summarise(tests = sum(unikkePCR),
+            positive = sum(unikkePCR_pos),
+            denominator = sum(Antal_Kategori),
+            new_tests_per_thousand = tests / denominator * 1000,
+            p_pos = positive / tests * 100,
+            incidence = positive / denominator * 1e5) %>% 
+  mutate(monday = Uge %>%
+           str_replace("(\\d{4})(\\d{2})", "\\1-W\\2-1") %>% 
+           ISOweek2date()) %>% 
+  select(monday, everything(), -Uge)
+```
+
+```{r clean_variants}
+variants <- wgs_week_export %>% 
+  as_tibble() %>% 
+  filter(
+    week >= "2021-W22",
+    # WHO_variant %in% c("delta", "omikron")
+  ) %>% 
+  mutate(monday = week %>% 
+           paste0("-1") %>% 
+           ISOweek2date()) %>% 
+  select(monday, variant = WHO_variant, proportion) %>% 
+  arrange(monday, variant)
+
+# To display later and also to add to data
+variants_transition_table <- variants %>% 
+  filter(monday %>% between(ymd("2021-11-15"),
+                            ymd("2022-01-24"))) %>% 
+  mutate(proportion = round(proportion, 2)) %>% 
+  pivot_wider(names_from = variant,
+              values_from = proportion,
+              values_fill = 0)
+```
+
+
+
+I'm immediately throwing away WW samples that didn't arrive on Tuesday/Wednesday/Friday (except for those in the July pilot, but I won't be using that data anyway).
+
+I'm starting the analysis from Monday the 6th of September. In that week, we had almost 100 anlæg already contributing. I don't want to start later, because there's a turning point in early/mid September that would be a shame to lose.
+
+```{r clean_daily}
+# Daily
+dk_ww_daily <- ww_human %>% 
+  filter(date_receipt <= "2022-09-02") %>%  # This is the data we had before I got update from Ajna 2023-04-21.
+  # Get rid of non-Tue/Wed/Fri WW measurements
+  filter(date_receipt >= ymd("2021-09-01"),
+         wday(date_receipt, week_start = 1) %in% c(2, 3, 5)) %>% 
+  group_by(date_receipt) %>% 
+  summary_copies_per_person() %>% 
+  select(date_receipt, pop_ww, copies_per_person)
+
+dk_daily <- dk_ww_daily %>% 
+  full_join(raw_owid %>% 
+              filter(location == "Denmark",
+                     date >= ymd("2021-09-01")) %>% 
+              select(date, hosp_patients, weekly_hosp_admissions, new_cases),
+            by = c("date_receipt" = "date")) %>% 
+  arrange(date_receipt)
+```
+
+
+```{r clean_weekly}
+# Look at simple mean temperature over the period. This is to inform the
+# baseline value for the temperature interaction. (Weighted median gives the
+# same answer)
+temp_mean_ww <- ww_human %>%
+  filter(date_receipt >= ymd("2021-09-27"),
+         !is.na(rna_mean),
+         overlap_level == "1. anlæg") %>%
+  summarise(mean_temp = mean(temperature, na.rm = TRUE)) %>% 
+  pull()
+
+
+
+
+# Weekly
+dk_ww_weekly <- ww_human %>% 
+  filter_analysis() %>%
+  mutate(cpp = rna_mean * flow / population) %>% 
+  group_by(date_receipt = floor_monday(date_receipt)) %>% 
+  summarise(
+    cpp_wtd_med = Hmisc::wtd.quantile(cpp,
+                                      log10(population),
+                                      0.5),
+    pop_ww = sum(population),
+    flow_wtd_med = Hmisc::wtd.quantile(flow,
+                                       log10(population),
+                                       0.5),
+    # Temperature: difference from the average
+    temp_ww_wtd_med = Hmisc::wtd.quantile(temperature,
+                                          log10(population),
+                                          0.5) - temp_mean_ww,
+    n_samples = n(),
+)
+
+
+
+# Join all data ----
+
+# Start with WW data
+dk <- dk_ww_weekly %>% 
+  # Join in human
+  full_join(dk_human, by = c("date_receipt" = "monday")) %>% 
+  # Classify dominant variant periods
+  mutate(variant = case_when(
+    date_receipt %>% between(ymd("2021-07-01"), ymd("2021-12-13")) ~ "delta",
+    date_receipt %>% between(ymd("2021-12-14"), today()) ~ "omicron",
+  )) %>% 
+  # Join in quantitative variant data
+  left_join(
+    variants_transition_table %>% 
+      select(monday, p_delta = delta, p_omicron = omikron),
+    by = c("date_receipt" = "monday")
+  ) %>% 
+  arrange(date_receipt) %>% 
+  # Carry forward/backward the 0%/100% for Delta and Omicron
+  mutate(across(c(p_delta, p_omicron), ~ . %>% 
+           zoo::na.locf0() %>% 
+           zoo::na.locf0(fromLast = TRUE))) %>% 
+  select(-new_cases) %>% 
+  # Join in pleje
+  left_join(pleje %>% 
+              rename_with(~ paste0("pleje_", .), -monday),
+            by = c("date_receipt" = "monday"))
+
+```
+
+
+Split test/train
+
+```{r split_test_train}
+
+tt_cutoff <- ymd("2022-05-09")
+
+train_data <- dk %>% 
+  filter(date_receipt < tt_cutoff) %>% 
+  filter_studyperiod() %>% 
+  as_tsibble(index = date_receipt)
+
+test_data <- dk %>% 
+  filter(date_receipt >= tt_cutoff) %>% 
+  filter_studyperiod() %>% 
+  as_tsibble(index = date_receipt)
+
+```
+
+
+
+Regional
+
+```{r regional}
+regional_weekly <- ww_human %>%
+  filter_analysis() %>%
+  mutate(cpp = rna_mean * flow / population,
+         region = str_remove(region, "Region ")) %>%
+  group_by(region, date_receipt = floor_monday(date_receipt)) %>%
+  summarise(
+    cpp_wtd_med = Hmisc::wtd.quantile(cpp,
+                                      log10(population),
+                                      0.5),
+    pop_ww = sum(population),
+    flow_wtd_med = Hmisc::wtd.quantile(flow,
+                                       log10(population),
+                                       0.5),
+    # Temperature: difference from the average
+    temp_ww_wtd_med = Hmisc::wtd.quantile(temperature,
+                                          log10(population),
+                                          0.5) - temp_mean_ww,
+    n_samples = n(),
+    .groups = "drop"
+  ) %>%
+  ungroup() %>% 
+  inner_join(regional_human,
+            by = c("region",
+                   "date_receipt" = "monday")) %>%
+  mutate(variant = case_when(
+    date_receipt %>% between(ymd("2021-07-01"), ymd("2021-12-13")) ~ "delta",
+    date_receipt %>% between(ymd("2021-12-14"), today()) ~ "omicron",
+  )) %>%
+  left_join(
+    variants_transition_table %>%
+      select(monday, p_delta = delta),
+    by = c("date_receipt" = "monday")
+  ) %>%
+  arrange(date_receipt) %>%
+  mutate(p_delta = p_delta %>%
+           zoo::na.locf0() %>%
+           zoo::na.locf0(fromLast = TRUE),
+         region = recode(region, !!!geogs$regioner_english)) %>% 
+  as_tsibble(index = date_receipt, key = region)
+
+train_regional <- regional_weekly %>% 
+  filter(date_receipt < tt_cutoff)
+
+test_regional <- regional_weekly %>% 
+  filter(date_receipt >= tt_cutoff)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+# Human indicators
+
+This shows cases, admissions, and hospital occupancy. Cases come first, then admissions, and occupancy is last. Steen suggests looking at admissions, since they're less susceptible than occupancy to omicron being less severe/improvements in treatment. (I.e. people may be spending less time in hospital these days, so occupancy may be lower.)
+
+```{r}
+raw_owid %>% 
+  filter(location == "Denmark") %>% 
+  select(date,
+         icu_patients,
+         hosp_patients,
+         weekly_hosp_admissions,
+         new_cases) %>%
+  mutate(across(c(icu_patients,
+                  hosp_patients,
+                  new_cases),
+                rollmean, 7, fill = NA, align = "right")) %>%
+  filter(date >= ymd("2021-06-01")) %>% 
+  pivot_longer(c(hosp_patients, weekly_hosp_admissions, new_cases),
+               names_to = "measure") %>% 
+  filter(!is.na(value)) %>% 
+  mutate(measure = factor(measure, levels = c("new_cases",
+                                              "weekly_hosp_admissions",
+                                              "hosp_patients"))) %>% 
+  ggplot(aes(date, value, colour = measure)) +
+  geom_line(linewidth = 1.5) +
+  scale_x_date(date_breaks = "1 month",
+               date_labels = "%b") +
+  scale_y_log10() +
+  scale_colour_manual(values = c("pink", "violet", "purple")) +
+  labs(
+    title = "Comparison of case and hospitalisation numbers",
+    x = NULL,
+    y = "Count (log scale)",
+    colour = NULL
+  )
+```
+
+
+We can also look at incidence in care home staff. They were tested regularly for screening, so there should be less of an effect of the testing pattern for them.
+
+```{r}
+pleje_long <- pleje %>% 
+  rename(incidence_pleje = incidence,
+         p_pos_pleje = p_pos) %>% 
+  left_join(dk %>% 
+              select(date_receipt, incidence_dk = incidence),
+            by = c("monday" = "date_receipt")) %>% 
+  left_join(dk_ww_weekly %>% 
+              select(date_receipt, cpp_wtd_med),
+            by = c("monday" = "date_receipt")) %>% 
+  pivot_longer(c(p_pos_pleje, incidence_pleje, incidence_dk, cpp_wtd_med))
+
+pleje_long %>% 
+  filter(!is.na(value),
+         monday >= ymd("2021-09-01")) %>% 
+  group_by(name) %>% 
+  mutate(value = scales::rescale(value, to = c(1, 100))) %>% 
+  ungroup() %>% 
+  mutate(name = fct_relevel(name, "incidence_dk", "incidence_pleje")) %>%
+  mutate(name = fct_reorder_legend(name, value, monday)) %>% 
+  ggplot(aes(monday, value, colour = name)) +
+  geom_line(linewidth = 1.5) +
+  scale_x_date(date_breaks = "1 month",
+               date_labels = "%b") +
+  scale_y_log10() + 
+  scale_colour_brewer(palette = "Set2") +
+  labs(title = "Comparison of measures",
+       x = NULL,
+       y = "Scaled value",
+       colour = NULL)
+```
+
+But the incidence for the care home people is basically identical to the observed incidence for Denmark. The percentage positive is different, but not in a way that looks more like the wastewater. So don't think this dataset would help us in any way.
+
+
+## Hospitalisations
+
+### Occupancy
+
+I.e. number of people currently in hospital.
+
+Want to see if there's a weekly pattern.
+
+```{r}
+raw_owid %>%
+  filter(location == "Denmark") %>%
+  select(date, hosp_patients) %>%
+  mutate(hosp_patients7 = rollmean(hosp_patients, 7, fill = NA)) %>%
+  pivot_longer(-date) %>%
+  filter(!is.na(value),
+         date >= ymd("2021-09-01")) %>% 
+  ggplot(aes(date, value, colour = name)) +
+  geom_line() +
+  geom_point(data = ~ filter(., name == "hosp_patients",
+                             wday(date, week_start = 1) %in% 6:7),
+             aes(shape = wday(date, week_start = 1) %in% 6:7),
+             size = 1.7) +
+  scale_y_log10() +
+  scale_shape_manual(breaks = c(TRUE),
+              labels = c("Weekend"),
+              values = c(8, NA)) +
+  labs(title = "Hospitalisations, 2022",
+       colour = "Smoothed or not",
+       shape = NULL,
+       x = NULL,
+       y = "People in hospital")
+```
+
+Since 2022, weekends have been clearly lower than weekdays. That isn't so much the case for 2021 though, weirdly. Maybe it's something that happens when there are a lot of people in hospital?
+
+
+**Conclusion:** in any case, I think using the 7-day smoothed hospitalisations makes sense.
+
+Note: the 7-day smoothed hospitalisations are right-aligned, i.e. they refer to the past 7 days. The weekly WW results are either left- or centre-aligned, depending on whether we include the `+ days(3)`. And incidence is centre-aligned. This only matters for the interpretation.
+
+
+
+
+
+
+
+# WW
+
+The mean number of weekly samples was `r round(mean(dk$n_samples), 1)`.
+
+## Temperature
+
+```{r}
+ww_human %>%
+  filter_analysis() %>% 
+  transmute(date_receipt = floor_date(date_receipt, "week", week_start = 1),
+            temp = parse_number(temperatur_c),
+            population) %>% 
+  filter(temp >= 0, temp <= 30) %>%
+  ggplot(aes(date_receipt, temp, group = date_receipt)) +
+  geom_point(data = ~ sample_n(., 5000),
+             position = position_jitter(height = 0),
+             alpha = 0.05,
+             colour = "grey30") +
+  geom_boxplot(aes(weight = log10(population)),
+               outlier.shape = NA,
+               fill = "transparent") +
+  scale_x_date(date_breaks = "1 month",
+               labels = label_month_first_year()) +
+  theme(panel.grid.major.x = element_blank()) +
+  labs(
+    title = "Reported wastewater temperature over time",
+    x = NULL,
+    y = "Temperature (\u00B0C)"
+  )
+```
+
+These boxplots are weighted by `log10(population)`. I'm not sure that works exactly the same as the way I'm weighting by the log population elsewhere, but if there are differences, they're marginal (I checked against `dk_weekly`).
+
+
+This is just to prove to myself that we did the log transformation at the right point.
+
+`rna_mean * flow / population`, then weighted median, then transform to log scale. Gives the same result as two other methods I tried. The two weird ones were always going to be weird. (The three don't look identical because I added some jitter to make sure they're visible.)
+
+```{r}
+ww_human %>% 
+  filter_analysis() %>%
+  mutate(
+    cpp = rna_mean * flow / population,
+    cpp2 = log10(rna_mean * flow / population),
+    cpp3 = log10(rna_mean) * flow / population,
+    cpp4 = log10(rna_mean * flow) / log10(population),
+    cpp5 = log10(rna_mean * flow) - log10(population),
+  ) %>% 
+  group_by(date_receipt = floor_monday(date_receipt)) %>% 
+  summarise(
+    x1_log_after_median = log10(Hmisc::wtd.quantile(cpp,
+                                                    log10(population),
+                                                    0.5)),
+    x2_log_equation_in_median = Hmisc::wtd.quantile(cpp2,
+                                                    log10(population),
+                                                    0.5),
+    x3_log_only_rna = Hmisc::wtd.quantile(cpp3,
+                                          log10(population),
+                                          0.5),
+    x4_log_numerator_denom = Hmisc::wtd.quantile(cpp4,
+                                                 log10(population),
+                                                 0.5),
+    x5_log_num_denom_subtract = Hmisc::wtd.quantile(cpp5,
+                                                    log10(population),
+                                                    0.5),
+    
+  ) %>% 
+  pivot_longer(-date_receipt) %>% 
+  ggplot(aes(date_receipt, value, colour = name)) + 
+  geom_line(position = position_jitter(width = 0,
+                                       height = 0.1),
+            linewidth = 2,
+            alpha = 1) +
+  labs(
+    title = "Comparison of different log methods",
+    subtitle = "Jitter added to make them all visible, but 1/2/5 are identical",
+    x = NULL,
+    y = "Weighted median of CPP,\nsomehow on the log scale",
+    colour = NULL
+  )
+
+```
+
+
+
+
+# Variants
+
+Want to test variant information in the model. We can just look at which variant is dominant each week.
+
+```{r}
+variants %>% 
+  mutate(variant = if_else(proportion < 0.01, "other", variant) %>% 
+           fct_relevel("other", "delta", "omikron")) %>% 
+  filter_studyperiod(date_col = monday) %>% 
+  # complete(WHO_variant, monday, fill = list(proportion = 0)) %>% 
+  ggplot(aes(monday, proportion, fill = variant)) +
+  # geom_hline(yintercept = 0.5, colour = "grey60") +
+  geom_col(width = 7, alpha = 1, position = position_fill()) +
+  scale_x_date(date_breaks = "1 month",
+               date_labels = "%b") +
+  scale_y_continuous(labels = scales::percent_format(1)) +
+  scale_fill_manual(breaks = c("other", "delta", "omikron"),
+                    labels = c("Other", "Delta", "Omicron"),
+                    values = c("grey30", "#5DA5DA", "#FAA43A")) +
+  # scale_fill_few() +
+  theme(axis.text.x = element_text(hjust = 0)) +
+  labs(
+    x = NULL,
+    y = "Proportion of human isolates",
+    fill = NULL
+  )
+
+
+ggsave(here("paper/figures/Appendix Figure E - variant proportion.pdf"),
+       width = 5,
+       height = 2,
+       units = "in",
+       dpi = 300,
+       scale = 1.6)
+```
+
+
+When exactly was the transition to omicron?
+
+```{r}
+variants_transition_table
+```
+
+The dominant variant changed between 2021-12-13 and 2021-12-20.
+
+I've added this information to the `dk_weekly` dataset before. (I haven't added it to the one with lags yet, because I don't know if it should lag with the incidence or stay stable with the WW.)
+
+
+
+# Cross-correlation
+
+This excludes samples received on weird days of the week. It allows the lags to extend across months, it's only the WW that's restricted to that month.
+
+```{r, fig.height=3.2}
+# Function to calculate weighted correlations at different lags.
+lag_cors <- function(df, x, y, lags, weights = 1) {
+  df <- df %>% 
+    transmute(x = {{x}},
+              y = {{y}},
+              weights = {{weights}})
+  
+  cors <- rep(NA_real_, length(lags))
+  
+  for (i in seq_along(lags)) {
+    cors[i] <- df %>%
+      mutate(y = shift(y, lags[i])) %>%
+      filter(!is.na(x),
+             !is.na(y)) %$%
+      weights::wtd.cor(x, y, weight = weights) %>%
+      .[, "correlation"]
+  }
+  
+  lagged_cors <- tibble(lag = lags,
+                        cor = cors)
+  
+  return(lagged_cors)
+  
+}
+
+# Creating nested datasets for each month. They contain only one month's WW data
+# (the "focal month"), but hospitalisations from before and after as well, so we
+# can lead/lag outside of the month. Keeping 21 days in either direction because
+# that seems enough.
+nested <- dk_daily %>% 
+  # Removing WW data for weird days of the week after July.
+  mutate(across(c(copies_per_person, pop_ww),
+                na_predicate,
+                ~ date_receipt >= ymd("2021-08-01") & 
+                  !wday(date_receipt, week_start = 1) %in% c(2, 3, 5))) %>% 
+  # Cross-join to repeat all the data for each focal month
+  full_join(
+    tibble(focal_month = seq(ymd("2021-09-01"),
+                             today() - days(21),
+                             by = "1 month")),
+    by = character()) %>% 
+  mutate(across(c(copies_per_person, pop_ww),
+                na_predicate,
+                ~ floor_date(date_receipt, "month") != focal_month)) %>% 
+  arrange(focal_month, date_receipt) %>% 
+  tsibble::as_tsibble(index = date_receipt, key = focal_month) %>%
+  # Getting rid of some unnecessary rows
+  filter(date_receipt >= focal_month - days(21),
+         date_receipt <= focal_month + months(1) + days(21)) %>%
+  nest_by(focal_month)
+
+
+
+lagged_cors <- nested %>% 
+  mutate(lagged_cors = list(lag_cors(data,
+                                     log10(copies_per_person),
+                                     log10(zoo::rollmean(new_cases, 7, fill = NA, align = "center")),
+                                     -14:14))) %>% 
+  select(-data) %>% 
+  unnest(lagged_cors) %>% 
+  ungroup() 
+
+
+lagged_cors %>% 
+  ggplot(aes(lag, focal_month, fill = cor)) +
+  geom_tile(height = 31) +
+  geom_vline(xintercept = 0) +
+  scale_fill_distiller(type = "div", palette = 5, direction = 1,
+                       breaks = seq(-1, 1, 0.25)) +
+  labs(
+    title = "Windowed cross-correlation:\nlog10(copies_per_person) & log10(new_cases)",
+    y = "Month of WW",
+    fill = "Weighted\ncorrelation",
+    caption = "new_cases is 7-day smoothed because of 0s (e.g. Christmas)"
+  )
+```
+
+
+
+
+
+# Main model
+
+Incidence, WW, tests:
+
+```{r}
+# dk %>% 
+#   filter_studyperiod() %>% 
+#   mutate(new_tests_per_person = new_tests_per_thousand * 1000) %>% 
+#   pivot_longer(c(cpp_wtd_med, incidence, new_tests_per_person),
+#                names_to = "measure") %>% 
+#   ggplot(aes(date_receipt, value, colour = measure)) +
+#   geom_vline(xintercept = ymd("2022-01-01"), colour = "grey80") +
+#   geom_line(linewidth = 2) +
+#   scale_y_log10() +
+#   scale_x_date(date_breaks = "1 month",
+#                labels = label_month_first_year()) +
+#   scale_colour_manual(breaks = c("incidence",
+#                                  "cpp_wtd_med",
+#                                  "new_tests_per_person"),
+#                       labels = c("Incidence per 100k",
+#                                  "RNA copies per person",
+#                                  "Tests per person"),
+#                       values = c("grey60",
+#                                  "deepskyblue",
+#                                  "maroon")) +
+#   theme(legend.position = "top",
+#         legend.justification = "left",
+#         axis.text.x = element_text(hjust = 0)) +
+#   labs(title = "Model variables over time",
+#        x = NULL,
+#        y = NULL,
+#        colour = NULL)
+# 
+# 
+# dk %>% 
+#   filter_studyperiod() %>% 
+#   pivot_longer(c(cpp_wtd_med, incidence, new_tests_per_thousand,
+#                  pleje_incidence),
+#                names_to = "measure") %>% 
+#   ggplot(aes(date_receipt, value, colour = measure)) +
+#   geom_vline(xintercept = ymd("2022-01-01"), colour = "grey80") +
+#   geom_line(linewidth = 2) +
+#   scale_y_log10() +
+#   scale_x_date(date_breaks = "1 month",
+#                labels = label_month_first_year(month_format = "%B",
+#                                                month_year_format = "%B\n%Y")) +
+#   scale_colour_manual(breaks = c(
+#     "cpp_wtd_med",
+#     "pleje_incidence",
+#     "incidence",
+#     "new_tests_per_thousand"
+#   ),
+#   labels = c(
+#     "Wastewater RNA\ncopies per person",
+#     "Care personnel\nincidence per 100k",
+#     "Incidence per 100k",
+#     "Tests per 1,000"
+#   ),
+#   values = c(
+#     "deepskyblue",
+#     "pink",
+#     "grey60",
+#     "forestgreen"
+#   )) +
+#   theme(legend.key.height = unit(24, "pt"),
+#         axis.text.x = element_text(hjust = 0)) +
+#   labs(title = "Model variables over time",
+#        x = NULL,
+#        y = NULL,
+#        colour = NULL)
+
+
+
+dk %>% 
+  filter_studyperiod() %>%
+  pivot_longer(c(cpp_wtd_med, incidence, new_tests_per_thousand,
+                 pleje_incidence, pleje_new_tests_per_thousand),
+               names_to = "measure") %>% 
+  ggplot(aes(date_receipt, value, colour = measure)) +
+  geom_vline(xintercept = ymd("2022-01-01"), colour = "grey80") +
+  geom_line(linewidth = 1.5) +
+  scale_y_log10(labels = scales::label_comma()) +
+  scale_x_date(date_breaks = "1 month",
+               labels = label_month_first_year(month_format = "%b",
+                                               month_year_format = "%b\n%Y")) +
+  scale_colour_manual(breaks = c(
+    "cpp_wtd_med",
+    "pleje_incidence",
+    "incidence",
+    "pleje_new_tests_per_thousand",
+    "new_tests_per_thousand"
+  ),
+  labels = c(
+    "Wastewater RNA\ncopies per person",
+    "Care personnel\nincidence per 100k",
+    "Incidence per 100k",
+    "Care personnel\ntests per 1,000",
+    "Tests per 1,000"
+  ),
+  values = c(
+    "deepskyblue",
+    "grey70",
+    "black",
+    "palegreen2",
+    "green4"
+  )) +
+  theme(legend.key.height = unit(24, "pt"),
+        axis.text.x = element_text(hjust = 0),
+        panel.grid = element_line(colour = "grey94")) +
+  labs(title = NULL,
+       x = NULL,
+       y = NULL,
+       colour = NULL)
+
+
+ggsave(here("paper/figures/Figure 1.pdf"),
+       width = 5,
+       height = 2,
+       units = "in",
+       dpi = 300,
+       scale = 1.6)
+
+
+```
+
+
+```{r}
+dk %>%
+  ggplot(aes(cpp_wtd_med, incidence)) +
+  geom_path(colour = "grey70") +
+  geom_point(aes(colour = variant),
+             size = 3, alpha = 0.5) + 
+  scale_x_log10() + 
+  scale_y_log10() +
+  coord_fixed()
+
+dk %>%
+  ggplot(aes(new_tests_per_thousand, incidence)) +
+  geom_path(colour = "grey70") +
+  geom_point(aes(colour = variant),
+             size = 3, alpha = 0.5) + 
+  scale_x_log10() + 
+  scale_y_log10() +
+  coord_fixed()
+```
+
+
+
+
+## Linear models
+
+### Specific models {.tabset}
+
+Specifying models:
+
+1. lm `log10(new_cases) ~ log10(cpp_wtd_med)`
+2. lm `log10(new_cases) ~ log10(cpp_wtd_med) + log10(new_tests_per_thousand)`
+3. ARIMA
+
+I weighted observations by `log10(pop_ww)`, which is the cumulative population per week of all the anlæg that were sampled.
+
+
+#### M1
+
+
+```{r}
+m1 <- dk %>% 
+  filter_studyperiod() %>% 
+  lm(log10(incidence) ~ log10(cpp_wtd_med),
+     data = .)
+
+m1_augmented <- broom::augment(m1, dk %>% filter_studyperiod(),
+                               interval = "prediction")
+
+
+summary(m1)
+```
+
+
+
+#### M2
+
+```{r}
+m2 <- dk %>% 
+  filter_studyperiod() %>% 
+  lm(log10(incidence) ~ log10(cpp_wtd_med) +
+       log10(new_tests_per_thousand),
+     data = .)
+
+m2_augmented <- broom::augment(m2, dk %>% filter_studyperiod(),
+                               interval = "prediction")
+
+
+summary(m2)
+```
+
+
+
+
+```{r}
+m2_augmented %>% 
+  ggplot(aes(date_receipt)) +
+  geom_line(aes(y = log10(incidence),
+                colour = "Observed"),
+            linewidth = 2.5) +
+  geom_point(aes(y = .fitted,
+                 colour = "Predicted"),
+             size = 3) +
+  expand_limits(y = 0) +
+  scale_x_date(date_breaks = "1 month",
+               date_labels = "%b") +
+  scale_colour_manual(breaks = c("Observed", "Predicted"),
+                      values = c("grey85", "darkorange")) +
+  labs(title = "M2 fit",
+       x = NULL,
+       y = "Log incidence",
+       colour = NULL)
+```
+
+
+
+#### M3
+
+Try adding temperature
+
+```{r, fig.height = 2.5, fig.width = 6}
+m2_augmented %>% 
+  ggplot(aes(date_receipt, .resid)) +
+  geom_hline(yintercept = 0) +
+  geom_line(aes(colour = "M2 residuals"),
+            linewidth = 1.5) +
+  geom_line(aes(y = (temp_ww_wtd_med - mean(temp_ww_wtd_med)) / 10,
+                colour = "temperature"),
+            linewidth = 1.5) +
+  labs(title = "M2 residuals and temperature",
+       x = NULL,
+       y = NULL,
+       colour = NULL)
+```
+
+
+
+
+```{r}
+m3 <- dk %>% 
+  filter_studyperiod() %>% 
+  lm(log10(incidence) ~
+       log10(cpp_wtd_med) +
+       log10(new_tests_per_thousand) +
+       log10(cpp_wtd_med):temp_ww_wtd_med,
+     data = .)
+
+m3_augmented <- broom::augment(m3, dk %>% filter_studyperiod(),
+                               interval = "prediction")
+
+
+m3_augmented %>% 
+  plot_orange(incidence,
+              title = "M3 fit (= M3 + temperature interaction)")
+
+
+summary(m3)
+```
+
+Looks even better.
+
+
+
+#### M4
+
+Now try adding the variant information. Don't know whether to add main effect and/or interaction, so we'll try all three options.
+
+```{r}
+
+# Continuous % delta
+m4.1_main <- dk %>% 
+  filter_studyperiod() %>% 
+  lm(log10(incidence) ~
+       log10(cpp_wtd_med) +
+       log10(new_tests_per_thousand) +
+       log10(cpp_wtd_med):temp_ww_wtd_med +
+       p_delta,
+     data = .)
+
+m4.1_main_interaction <- dk %>% 
+  filter_studyperiod() %>% 
+  lm(log10(incidence) ~
+       log10(cpp_wtd_med) +
+       log10(new_tests_per_thousand) +
+       log10(cpp_wtd_med):temp_ww_wtd_med +
+       log10(cpp_wtd_med)*p_delta,
+     data = .)
+
+m4.1_interaction <- dk %>% 
+  filter_studyperiod() %>% 
+  lm(log10(incidence) ~
+       log10(cpp_wtd_med) +
+       log10(new_tests_per_thousand) +
+       log10(cpp_wtd_med):temp_ww_wtd_med +
+       log10(cpp_wtd_med):p_delta,
+     data = .)
+
+
+# Model performance
+performance::compare_performance(m4.1_main,
+                                 m4.1_main_interaction,
+                                 m4.1_interaction,
+                                 metrics = c("AIC", "BIC", "R2"))
+```
+
+The continuous version containing only the interaction with wastewater x delta is best, so that's what we'll use.
+
+
+
+```{r}
+# Best version of M4
+m4 <- m4.1_interaction
+
+m4_augmented <- broom::augment(m4, dk %>% filter_studyperiod(),
+                               interval = "prediction")
+
+m4_augmented %>% 
+  plot_orange(incidence,
+              title = "M4 fit (WW, delta and temp interaction, testing)")
+
+print(summary(m4), digits = 3)
+```
+
+
+
+
+#### M5 {.active}
+
+This is M4 but without the temperature interaction (perhaps we don't need it anymore, now that we've got delta in the model).
+
+```{r}
+m5 <- dk %>% 
+  filter_studyperiod() %>% 
+  lm(log10(incidence) ~
+       log10(cpp_wtd_med) +
+       log10(new_tests_per_thousand) +
+       log10(cpp_wtd_med):p_delta,
+     data = .)
+
+m5_augmented <- broom::augment(m5, dk %>% filter_studyperiod(),
+                               interval = "prediction")
+
+m5_augmented %>%
+  plot_orange(incidence,
+              title = "M5 fit (WW, delta interaction, testing)")
+
+
+
+print(summary(m5), digits = 3)
+```
+
+
+#### M6
+
+This is without testing
+
+```{r}
+m6 <- dk %>% 
+  filter_studyperiod() %>% 
+  lm(log10(incidence) ~
+       log10(cpp_wtd_med) +
+       log10(cpp_wtd_med):p_delta,
+     data = .)
+
+m6_augmented <- broom::augment(m6, dk %>% filter_studyperiod(),
+                               interval = "prediction")
+
+m6_augmented %>%
+  plot_orange(incidence,
+              title = "M6 fit (WW, delta interaction)")
+
+
+
+print(summary(m6), digits = 3)
+```
+
+
+
+#### M7
+
+This is without WW
+
+```{r}
+m7 <- dk %>% 
+  filter_studyperiod() %>% 
+  lm(log10(incidence) ~
+       log10(new_tests_per_thousand),
+     data = .)
+
+m7_augmented <- broom::augment(m7, dk %>% filter_studyperiod(),
+                               interval = "prediction")
+
+m7_augmented %>%
+  plot_orange(incidence,
+              title = "M7 fit (tests)")
+
+
+
+print(summary(m6), digits = 3)
+```
+
+
+
+
+
+### Comparison
+
+Comparison of fit
+
+```{r}
+performance::compare_performance(m1, m2, m3, m4, m5, m6,
+                                 metrics = c("AIC", "BIC", "R2")) %>% 
+  as_tibble() %>% 
+  mutate(across(where(is.numeric), round, 3))
+```
+
+Each model is an improvement over the last. But once we've added the interaction with `p_delta` in M4, we no longer need the interaction with temperature.
+
+
+
+Linear model parameter estimates
+
+```{r}
+list(m1 = m1,
+     m2 = m2,
+     m3 = m3,
+     m4 = m4,
+     m5 = m5) %>% 
+  map_df(tidy, conf.int = TRUE, .id = ".model") %>% 
+  select(.model, term, estimate, conf.low, conf.high, std.error, p.value) %>% 
+  mutate(across(where(is.numeric) & !p.value, round, 3))
+```
+
+Clear to see that temperature isn't adding anything in M4.
+
+
+Graph comparing predictions
+
+```{r}
+bind_rows(#m1 = m1_augmented,
+          m2 = m2_augmented,
+          m3 = m3_augmented,
+          m4 = m4_augmented,
+          m5 = m5_augmented,
+          .id = ".model") %>% 
+  ggplot(aes(date_receipt)) +
+  geom_line(aes(y = log10(incidence)),
+            data = ~ distinct(., date_receipt, incidence),
+            linewidth = 3, colour = "grey30") +
+  geom_ribbon(aes(ymin = .lower, ymax = .upper,
+                  group = .model, fill = .model),
+              alpha = 0.1) +
+  geom_line(aes(y = .fitted, group = .model, colour = .model),
+            linewidth = 1.5) +
+  scale_x_date(date_breaks = "1 month", date_labels = "%b") +
+  scale_colour_brewer(aesthetics = c("colour", "fill"),
+                      type = "qual", palette = "Set2") +
+  labs(title = "Linear model predictions",
+       x = NULL,
+       y = "Fitted values (95% prediction interval)",
+       colour = NULL,
+       fill = NULL)
+```
+
+
+
+
+
+
+
+
+
+
+
+**Side track:** are the residuals related to flow? Used the same process for flow as we did for copies per person: weighted median per week, with `log10(pop_ww)` as the weights.
+
+```{r fig.width = 5, fig.height = 3}
+m5_augmented %>% 
+  ggplot(aes(flow_wtd_med, .resid)) +
+  geom_hline(yintercept = 0, colour = "grey70") +
+  geom_point(size = 3, alpha = 0.4) +
+  scale_x_log10() +
+  labs(title = "Relationship between flow and residuals",
+       x = "Weighted median of flow, for each weekly point (log scale)",
+       y = "Residuals from m3")
+```
+
+No very obvious pattern here.
+
+
+
+## ARIMA
+
+
+### Residuals {.tabset}
+
+```{r}
+
+#' Plot residuals over time and check autocorrelation
+#'
+#' @param df Augmented model
+#' @param title Plot title
+#' @param resid_col ".resid" by default. Might want to use .innov for some models.
+#' 
+plot_ts_residuals <- function(df, title = NULL, resid_col = ".resid") {
+  assert_that(has_name(df, c("date_receipt",
+                             resid_col)))
+  
+  resid_col <- ensym(resid_col)
+  
+  df %>% 
+    tsibble::as_tsibble(index = date_receipt) %>% 
+    feasts::gg_tsdisplay(!!resid_col, plot_type = "partial") +
+    labs(title = title)
+}
+```
+
+
+#### M1
+
+```{r}
+plot_ts_residuals(m1_augmented, "Residuals from M1")
+```
+
+
+#### M2
+
+```{r}
+plot_ts_residuals(m2_augmented, "Residuals from M2")
+```
+
+
+#### M3
+
+```{r}
+plot_ts_residuals(m3_augmented, "Residuals from M3")
+```
+
+
+#### M4
+
+```{r}
+plot_ts_residuals(m4_augmented, "Residuals from M4")
+```
+
+
+#### M5 {.active}
+
+```{r}
+plot_ts_residuals(m5_augmented, "Residuals from M5")
+```
+
+
+#### M6
+
+```{r}
+plot_ts_residuals(m6_augmented, "Residuals from M6")
+```
+
+
+#### M7
+
+```{r}
+plot_ts_residuals(m7_augmented, "Residuals from M7")
+
+```
+
+
+
+
+
+
+### Auto-suggested models
+
+These are the ARIMA model that it auto-suggests. ARIMA(1,0,0) is the model I would have guessed from looking at the ACF/PACF, based on [Lasse's lecture](https://www.youtube.com/watch?v=ZE_WGBe0_VU).
+
+```{r}
+
+bind_rows(m1 = m1_augmented,
+          m2 = m2_augmented,
+          m3 = m3_augmented,
+          m4 = m4_augmented,
+          m5 = m5_augmented,
+          m6 = m6_augmented,
+          m7 = m7_augmented,
+          .id = "linear_model") %>%
+  as_tsibble(index = date_receipt, key = linear_model) %>% 
+  model(arima_resid_auto = ARIMA(.resid))
+```
+
+
+
+
+### Fit models
+
+I've fitted ARIMA(1,0,0) models on each of the linear models. I've also included an ARIMA(0,0,0) for M4 (`m4_000`), which should be exactly equivalent to M4, so but it's in this fable framework so we can compare like with like.
+
+```{r}
+arimas_inc_000 <- dk %>% 
+  filter_studyperiod() %>% 
+  as_tsibble(index = date_receipt) %>% 
+  mutate(one = 1) %>% 
+  model(
+    m1_100 = ARIMA(log10(incidence) ~
+                     1 +
+                     log10(cpp_wtd_med) +
+                     pdq(1, 0, 0) +
+                     PDQ(0, 0, 0),
+                   method = "ML", approximation = FALSE),
+    m2_100 = ARIMA(log10(incidence) ~
+                     1 +
+                     log10(cpp_wtd_med) +
+                     log10(new_tests_per_thousand) +
+                     pdq(1, 0, 0) +
+                     PDQ(0, 0, 0),
+                   method = "ML", approximation = FALSE),
+    m3_100 = ARIMA(log10(incidence) ~
+                     1 +
+                     log10(cpp_wtd_med) +
+                     log10(new_tests_per_thousand) +
+                     log10(cpp_wtd_med):temp_ww_wtd_med +
+                     pdq(1, 0, 0) +
+                     PDQ(0, 0, 0),
+                   method = "ML", approximation = FALSE),
+    m4_100 = ARIMA(log10(incidence) ~ 
+                     1 +
+                     log10(cpp_wtd_med) +
+                     log10(new_tests_per_thousand) +
+                     log10(cpp_wtd_med):temp_ww_wtd_med +
+                     log10(cpp_wtd_med):p_delta +
+                     pdq(1, 0, 0) +
+                     PDQ(0, 0, 0),
+                   method = "ML", approximation = FALSE),
+    m5_100 = ARIMA(log10(incidence) ~ 
+                     1 +
+                     log10(cpp_wtd_med) +
+                     log10(new_tests_per_thousand) +
+                     log10(cpp_wtd_med):p_delta +
+                     pdq(1, 0, 0) +
+                     PDQ(0, 0, 0),
+                   method = "ML", approximation = FALSE),
+    m5_000 = ARIMA(log10(incidence) ~ 
+                     1 +
+                     log10(cpp_wtd_med) +
+                     log10(new_tests_per_thousand) +
+                     log10(cpp_wtd_med):p_delta +
+                     pdq(0, 0, 0) +
+                     PDQ(0, 0, 0),
+                   method = "ML", approximation = FALSE),
+    m6_100 = ARIMA(log10(incidence) ~ 
+                     1 +
+                     log10(cpp_wtd_med) +
+                     log10(cpp_wtd_med):p_delta +
+                     pdq(1, 0, 0) +
+                     PDQ(0, 0, 0),
+                   method = "ML", approximation = FALSE),
+    m7_100 = ARIMA(log10(incidence) ~ 
+                     # one +
+                     1 +
+                     log10(new_tests_per_thousand) +
+                     pdq(1, 0, 0) +
+                     PDQ(0, 0, 0),
+                   method = "ML", approximation = FALSE),
+    m8_100 = ARIMA(log10(incidence) ~ 
+                     1 +
+                     log10(cpp_wtd_med) +
+                     log10(new_tests_per_thousand) +
+                     log10(cpp_wtd_med):p_delta +
+                     log10(new_tests_per_thousand):p_delta +
+                     pdq(1, 0, 0) +
+                     PDQ(0, 0, 0),
+                   method = "ML", approximation = FALSE),
+    ar1 = ARIMA(log10(incidence) ~ pdq(1, 0, 0))
+  )
+  
+
+arimas <- arimas_inc_000 %>% select(-m5_000)
+```
+
+
+
+### Results
+
+Performance of the ARIMA models:
+
+```{r}
+glance(arimas_inc_000) %>% 
+  select(-ar_roots, -ma_roots) %>% 
+  mutate(across(c(log_lik:BIC), round, 1))
+```
+
+
+
+
+
+
+```{r, fig.height = 5, fig.width = 7}
+arimas %>% 
+  accuracy() %>%
+  select(-c(ME)) %>% 
+  full_join(arimas %>% 
+              glance() %>% 
+              select(.model, sigma2:BIC),
+            by = ".model") %>% 
+  pivot_longer(RMSE:BIC) %>%
+  mutate(name = fct_inorder(name)) %>% 
+  ggplot(aes(value, .model)) + 
+  geom_col(aes(fill = .model == "m5_100"), show.legend = FALSE) + 
+  scale_y_discrete(limits = rev) +
+  geom_vline(xintercept = 0, colour = "grey40") +
+  scale_fill_manual(values = c("grey80", "darkorange")) +
+  facet_wrap(~ name, scales = "free_x", nrow = 3) +
+  theme(panel.grid.major.y = element_blank()) +
+  labs(
+    title = "Performance measures",
+    x = NULL,
+    y = NULL
+  )
+```
+
+
+
+ARIMA model parameter estimates
+
+
+```{r}
+arimas_inc_000 %>% 
+  broom::tidy() %>% 
+  select(-statistic) %>% 
+  mutate(across(estimate:std.error,
+                round, 2))
+```
+
+Also, both models give WW much less importance, that's unfortunate.
+
+
+
+Here are the fitted values:
+
+```{r fig.height = 9, fig.width = 8}
+sigma2s_arima <- arimas %>% 
+  glance(fit) %>% 
+  # filter(.model == "ARIMA_100") %>% 
+  select(.model, sigma2)
+
+
+
+arimas %>% 
+  select(m2_100:m5_100) %>% 
+  broom::augment() %>% 
+  left_join(sigma2s_arima, by = ".model") %>% 
+  mutate(.lower = 10^(log10(.fitted) - 2 * sqrt(sigma2)),
+         .upper = 10^(log10(.fitted) + 2 * sqrt(sigma2))) %>%
+  bind_rows(
+    m2_augmented %>% 
+      mutate(.model = "M2",
+             .fitted = 10^.fitted,
+             .lower = 10^.lower,
+             .upper = 10^.upper),
+    m3_augmented %>% 
+      mutate(.model = "M3",
+             .fitted = 10^.fitted,
+             .lower = 10^.lower,
+             .upper = 10^.upper),
+    m4_augmented %>% 
+      mutate(.model = "M4",
+             .fitted = 10^.fitted,
+             .lower = 10^.lower,
+             .upper = 10^.upper),
+    m5_augmented %>% 
+      mutate(.model = "M5",
+             .fitted = 10^.fitted,
+             .lower = 10^.lower,
+             .upper = 10^.upper)
+  ) %>% 
+  ggplot(aes(date_receipt)) +
+  geom_line(data = ~ distinct(., date_receipt, incidence),
+            aes(y = incidence,
+                colour = "Observed"),
+            linewidth = 3) +
+  geom_ribbon(aes(ymin = .lower, ymax = .upper,
+                  group = .model, fill = "Fitted"),
+              alpha = 0.3) +
+  geom_line(aes(y = .fitted,
+                 colour = "Fitted"),
+             linewidth = 1.3) +
+  scale_y_log10() +
+  scale_x_date(date_breaks = "1 month",
+               date_labels = "%b") +
+  scale_colour_manual(aesthetics = c("colour", "fill"),
+                      values = c("grey80",
+                                 "darkorange"),
+                      breaks = c("Observed",
+                                 "Fitted")) +
+  guides(shape = "none",
+         fill = "none") +
+  theme(legend.position = "top",
+        legend.justification = "left") +
+  labs(title = "Linear and ARIMA models",
+       colour = NULL,
+       fill = NULL,
+       x = NULL,
+       y = "Incidence (95% prediction interval)") +
+  facet_wrap(~ .model, dir = "h", ncol = 2)
+```
+
+
+Here, I'm trying to compare the AR(1) models 5, 6, and 7. That's the final one, plus the ones missing testing or WW. But I get weird results: when I use `augment()`, all models look perfect, whereas when I use `forecast()` the two bad ones look terrible. What's the difference? That I start predicting from 0?
+
+```{r}
+arimas %>% 
+  select(m5_100:ar1) %>% 
+  broom::augment() %>% 
+  left_join(sigma2s_arima, by = ".model") %>%
+  mutate(.lower = 10^(log10(.fitted) - 2 * sqrt(sigma2)),
+         .upper = 10^(log10(.fitted) + 2 * sqrt(sigma2))) %>%
+  ggplot(aes(date_receipt)) +
+  geom_ribbon(aes(ymin = .lower, ymax = .upper,
+                  fill = .model, colour = .model),
+              alpha = 0.15, linetype = 3) +
+  geom_line(data = ~ distinct(., date_receipt, incidence),
+            aes(y = incidence,
+                colour = "Observed"),
+            linewidth = 3,
+            colour = "grey25") +
+  geom_line(aes(y = .fitted,
+                 colour = .model),
+             linewidth = 1.3,
+            alpha = 1) +
+  scale_y_log10() +
+  scale_x_date(date_breaks = "1 month",
+               date_labels = "%b") +
+  guides(shape = "none",
+         fill = "none") +
+  labs(title = "Fitted models",
+       colour = NULL,
+       fill = NULL,
+       x = NULL,
+       y = "Incidence")
+
+```
+
+
+
+
+
+#### Parameter for WW
+
+This is how the model estimates for WW change in each model. I calculated the CIs manually because I didn't know how to do them for the ARIMA models otherwise. I hope `2 * SE` is correct, it was slightly off for the linear ones (perhaps because of weighting?).
+
+```{r, fig.height = 3.5, fig.width = 5}
+list(m1 = m1,
+     m2 = m2,
+     m3 = m3,
+     m4 = m4,
+     m5 = m5,
+     m6 = m6) %>% 
+  map_df(tidy, .id = ".model") %>% 
+  filter(term == "log10(cpp_wtd_med)") %>% 
+  bind_rows(arimas %>% 
+              tidy() %>% 
+              filter(term == "log10(cpp_wtd_med)")) %>% 
+  mutate(lower = estimate - 2 * std.error,
+         upper = estimate + 2 * std.error,
+         .model = fct_inorder(.model)) %>% 
+  ggplot(aes(estimate, .model)) +
+  geom_vline(xintercept = c(0, 1), colour = "grey60") +
+  geom_linerange(aes(xmin = lower, xmax = upper)) +
+  geom_point(aes(size = 1 / std.error), shape = 15, show.legend = FALSE) +
+  scale_y_discrete(limits = rev) +
+  scale_x_continuous(expand = expansion(0.015), breaks = breaks_pretty()) +
+  theme(panel.grid.major.y = element_blank()) +
+  labs(
+    title = "Model estimates for log10(cpp_wtd_med)",
+    x = "Estimate (95% CI)",
+    y = NULL,
+    caption = glue("m3 and m3_100 assume WW temperature of ",
+                   "{temp_mean_ww}\u00B0C (the mean temperature)",
+                   temp_mean_ww = round(temp_mean_ww, 1))
+  )
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Forecast
+
+
+Train the model using a subset of the data, cut off before now. Then see how well it predicts the full set.
+
+Here, I've cut it off on `r tt_cutoff`.
+
+
+
+```{r}
+trained_arimas <- train_data %>% 
+  model(
+    m4_000 = ARIMA(log10(incidence) ~ 
+                     1 +
+                     log10(cpp_wtd_med) +
+                     log10(new_tests_per_thousand) +
+                     log10(cpp_wtd_med):temp_ww_wtd_med +
+                     log10(cpp_wtd_med):p_delta +
+                     pdq(0, 0, 0) +
+                     PDQ(0, 0, 0),
+                   method = "ML", approximation = FALSE),
+    m4_100 = ARIMA(log10(incidence) ~ 
+                     1 +
+                     log10(cpp_wtd_med) +
+                     log10(new_tests_per_thousand) +
+                     log10(cpp_wtd_med):temp_ww_wtd_med +
+                     log10(cpp_wtd_med):p_delta +
+                     pdq(1, 0, 0) +
+                     PDQ(0, 0, 0),
+                   method = "ML", approximation = FALSE),
+    m5_000 = ARIMA(log10(incidence) ~ 
+                     1 +
+                     log10(cpp_wtd_med) +
+                     log10(new_tests_per_thousand) +
+                     log10(cpp_wtd_med):p_delta +
+                     pdq(0, 0, 0) +
+                     PDQ(0, 0, 0),
+                   method = "ML", approximation = FALSE),
+    m5_100 = ARIMA(log10(incidence) ~ 
+                     1 +
+                     log10(cpp_wtd_med) +
+                     log10(new_tests_per_thousand) +
+                     log10(cpp_wtd_med):p_delta +
+                     pdq(1, 0, 0) +
+                     PDQ(0, 0, 0),
+                   method = "ML", approximation = FALSE),
+    # m6_100 = ARIMA(log10(incidence) ~ 
+    #                  1 +
+    #                  log10(cpp_wtd_med) +
+    #                  log10(cpp_wtd_med):p_delta +
+    #                  pdq(1, 0, 0) +
+    #                  PDQ(0, 0, 0),
+    #                method = "ML", approximation = FALSE),
+    # m7_100 = ARIMA(log10(incidence) ~ 
+    #                  # one +
+    #                  1 +
+    #                  log10(new_tests_per_thousand) +
+    #                  pdq(1, 0, 0) +
+    #                  PDQ(0, 0, 0),
+    #                method = "ML", approximation = FALSE),
+    # m8_100 = ARIMA(log10(incidence) ~ 
+    #                  1 +
+    #                  log10(cpp_wtd_med) +
+    #                  log10(new_tests_per_thousand) +
+    #                  log10(cpp_wtd_med):p_delta +
+    #                  log10(new_tests_per_thousand):p_delta +
+    #                  pdq(1, 0, 0) +
+    #                  PDQ(0, 0, 0),
+    #                method = "ML", approximation = FALSE),
+  )
+```
+
+
+
+
+Parameter estimates
+
+```{r}
+trained_arimas %>% 
+  broom::tidy() %>% 
+  select(-statistic) %>% 
+  mutate(across(estimate:std.error,
+                round, 2))
+```
+
+
+
+
+Model fit
+
+```{r}
+glance(trained_arimas)
+```
+
+```{r}
+trained_arimas %>% 
+  augment() %>% 
+  ggplot(aes(date_receipt)) +
+  geom_line(aes(y = incidence),
+            data = ~ distinct(., date_receipt, incidence),
+            linewidth = 3, colour = "grey85") +
+  geom_line(aes(y = .fitted, colour = .model),
+         linewidth = 1.5) +
+  scale_y_log10()
+```
+
+Training set performance 
+
+```{r}
+trained_arimas %>% 
+  accuracy() %>%
+  select(-c(ME, MPE)) %>% 
+  full_join(trained_arimas %>% 
+              glance %>% 
+              select(.model, sigma2:BIC),
+            by = ".model") %>% 
+  pivot_longer(RMSE:BIC) %>%
+  mutate(name = fct_inorder(name)) %>% 
+  ggplot(aes(value, .model)) + 
+  geom_col(aes(fill = .model == "m5_100"), show.legend = FALSE) + 
+  scale_y_discrete(limits = rev) +
+  geom_vline(xintercept = 0, colour = "grey40") +
+  scale_fill_manual(values = c("grey80", "darkorange")) +
+  facet_wrap(~ name, scales = "free_x", nrow = 3) +
+  theme(panel.grid.major.y = element_blank()) +
+  labs(
+    title = "Performance measures in training set",
+    x = NULL,
+    y = NULL
+  )
+```
+
+
+
+Compare model forecasts
+
+```{r}
+trained_arimas %>% 
+  forecast(test_data) %>%
+  autoplot(as_tsibble(dk %>% 
+                        filter_studyperiod(), index = date_receipt),
+           level = 95, alpha = 0.7) +
+  scale_y_log10()
+```
+
+The M5 forecasts (no temperature interaction) are clearly better. That fits with the strange negative coefficient for the temperature interaction, it doesn't make sense.
+
+
+Forecast
+
+```{r}
+
+trained_arimas %>% 
+  select(m5_100) %>% 
+  forecast(test_data) %>% 
+  hilo(level = 95) %>% 
+  rename(conf = "95%") %>% 
+  unpack_hilo(cols = conf) %>% 
+  relocate(.mean, conf_lower, conf_upper,
+           .after = date_receipt) %>% 
+  ggplot(aes(date_receipt)) +
+  geom_vline(xintercept = ymd("2022-01-01"), colour = "grey80") +
+    geom_line(data = dk %>% 
+                filter_studyperiod(),
+            aes(y = incidence,
+                colour = "Observed"),
+            linewidth = 2) +
+  geom_ribbon(aes(ymin = conf_lower,
+                  ymax = conf_upper),
+              fill = "purple",
+              alpha = 0.2) +
+  geom_line(aes(y = .mean,
+                colour = "Validation (95%\nprediction interval)"),
+            linewidth = 1.5) +
+  geom_line(data = trained_arimas %>% 
+              select(m5_100) %>% 
+              augment(),
+            aes(y = .fitted,
+                colour = "Model fit"),
+            linewidth = 1.5) +
+  scale_x_date(date_breaks = "1 month",
+               labels = label_month_first_year()) +
+  scale_y_log10(labels = scales::label_comma(),
+                breaks = scales::breaks_log(6)) +
+  expand_limits(y = c(30, 10000)) +
+  scale_colour_manual(breaks = c("Observed",
+                                 "Model fit",
+                                 "Validation (95%\nprediction interval)"),
+                      values = c("black",
+                                 "darkorange",
+                                 "purple")) +
+  theme(axis.text.x = element_text(hjust = 0)) +
+  labs(
+    title = NULL,
+    x = NULL,
+    y = "Incidence per 100,000",
+    colour = NULL,
+    fill = NULL
+  )
+
+
+ggsave(here("paper/figures/Figure 2A.pdf"),
+       width = 5,
+       height = 2,
+       units = "in",
+       dpi = 300,
+       scale = 1.6)
+
+
+# This would be a one-step forecast, but that's not what we want.
+
+# trained_arimas %>% 
+#   select(m5_100) %>% 
+#   refit(test_data) %>% 
+#   augment() %>% 
+#   ggplot(aes(date_receipt)) +
+#   geom_line(data = dk,
+#             aes(y = incidence,
+#                 colour = "Observed"),
+#             linewidth = 1) +
+#   geom_line(aes(y = .fitted,
+#                 colour = "Forecast (95% PI)"),
+#             linewidth = 1) +
+#   geom_line(data = trained_arimas %>% 
+#               select(m5_100) %>% 
+#               augment(),
+#             aes(y = .fitted,
+#                 colour = "Model fit"),
+#             linewidth = 1) +
+#   scale_colour_manual(breaks = c("Observed",
+#                                  "Model fit",
+#                                  "Forecast (95% PI)"),
+#                       values = c("black",
+#                                  "darkorange",
+#                                  "purple")) +
+#   scale_y_log10(limits = c(20, 10000)) +
+#   labs(
+#     title = "One-step forecast",
+#     x = NULL,
+#     y = "Incidence per 100,000",
+#     colour = NULL,
+#     fill = NULL
+#   )
+
+
+```
+
+
+
+
+
+
+
+### Forecast performance
+
+On a linear scale: observed vs forecast
+
+```{r}
+observed_v_forecast <- trained_arimas %>% 
+  select(m5_100) %>% 
+  forecast(test_data) %>% 
+  hilo(level = 95) %>% 
+  rename(conf = "95%") %>% 
+  unpack_hilo(cols = conf) %>% 
+  relocate(.mean, conf_lower, conf_upper,
+           .after = date_receipt) %>% 
+  select(date_receipt:conf_upper) %>% 
+  left_join(dk %>% 
+              filter_studyperiod() %>% 
+              select(date_receipt, observed = incidence),
+            by = "date_receipt") 
+
+observed_v_forecast %>% 
+  ggplot(aes(date_receipt)) +
+  geom_line(aes(y = observed,
+                colour = "Observed"), linewidth = 2) +
+  geom_ribbon(aes(ymin = conf_lower, ymax = conf_upper),
+              fill = "purple",
+              alpha = 0.2) +
+  geom_line(aes(y = .mean,
+                colour = "Forecast"), linewidth = 2) +
+  scale_colour_manual(breaks = c("Observed",
+                                 "Forecast"),
+                      values = c("black",
+                                 "purple")) +
+  expand_limits(y = 0) +
+  labs(title = "Comparison of observed and forecast on linear scale",
+       x = NULL,
+       y = "Incidence per 100,000",
+       colour = NULL)
+```
+
+
+And as a percentage
+
+```{r}
+observed_v_forecast %>% 
+  mutate(factor = .mean / observed) %>%
+  ggplot(aes(date_receipt, factor)) +
+  geom_hline(yintercept = c(0, 1)) +
+  geom_line(linewidth = 1.5, colour = "purple") +
+  geom_point(size = 4.5, shape = 21, colour = "white", fill = "purple",
+             stroke = 2) +
+  geom_text(aes(label = scales::percent(factor, accuracy = 1)),
+            nudge_y = -0.045, nudge_x = 0.3) +
+  scale_y_continuous(labels = scales::percent) +
+  expand_limits(y = c(0, 1)) +
+  labs(
+    title = "Forecast underestimation",
+    x = NULL,
+    y = "Percentage of observed value\n(100% is perfect)"
+  )
+```
+
+
+Mean percentage. This is 1 - MPE (and MPE = MAPE, since they're all negative).
+
+```{r}
+observed_v_forecast %>% 
+  as_tibble() %>% 
+  mutate(factor = .mean / observed) %>% 
+  summarise(mean_factor = mean(factor))
+```
+
+
+These are the accuracy measures on [multi-step forecasts](https://otexts.com/fpp3/accuracy.html#examples). This is the regular way of doing it, but there's something weird about the variance increasing with the time horizon of the forecast.
+
+```{r}
+
+trained_arimas %>% 
+  select(m5_100) %>% 
+  forecast(test_data) %>% 
+  accuracy(test_data)
+
+
+trained_arimas %>% 
+  # rename_all(str_replace, ".m", "m") %>% 
+  forecast(test_data) %>% 
+  accuracy(data = test_data) %>% 
+  select(-c(ME, MPE)) %>% 
+  relocate(RMSE, MAE, MAPE, ACF1, .after = .type) %>% 
+  pivot_longer(where(is.numeric)) %>% 
+  filter(!is.nan(value)) %>% 
+  mutate(name = fct_inorder(name)) %>% 
+  ggplot(aes(value, .model)) +
+  geom_col(aes(fill = .model == "m5_100"), show.legend = FALSE) +
+  geom_vline(xintercept = 0, colour = "grey40") +
+  scale_fill_manual(values = c("grey70", "darkorange")) +
+  facet_wrap(~ name, scales = "free_x", ncol = 3) +
+  theme(panel.grid.major.y = element_blank()) +
+  labs(
+    title = "Multi-step forecast accuracy measures",
+    x = NULL,
+    y = NULL
+  )
+```
+
+
+And these are accuracy measures on [one-step forecasts](https://otexts.com/fpp3/training-test.html#one-step-forecasts-on-test-data). This way, the forecast is based on all preceding points, including ones in the test data? So the variance should stay the same and I guess that's better.
+
+```{r}
+trained_arimas %>% 
+  refit(test_data) %>%
+  accuracy() %>% 
+  select(-c(ME, MPE)) %>% 
+  relocate(RMSE, MAE, MAPE, ACF1, .after = .type) %>% 
+  pivot_longer(where(is.numeric)) %>% 
+  filter(!is.nan(value)) %>% 
+  mutate(name = fct_inorder(name)) %>% 
+  ggplot(aes(value, .model)) +
+  geom_col(aes(fill = .model == "m5_100"), show.legend = FALSE) +
+  geom_vline(xintercept = 0, colour = "grey40") +
+  scale_fill_manual(values = c("grey70", "darkorange")) +
+  facet_wrap(~ name, scales = "free_x", ncol = 3) +
+  theme(panel.grid.major.y = element_blank()) +
+  labs(
+    title = "One-step forecast performance measures",
+    x = NULL,
+    y = NULL
+  )
+```
+
+
+
+
+
+
+
+
+
+### Lags
+
+Checking lags by week
+
+```{r}
+laglead <- list()
+
+laglead$lag2 <- dk %>% 
+  mutate(across(c(incidence, new_tests_per_thousand, p_delta), shift, -2)) %>% 
+  filter_studyperiod() %>% 
+  filter(date_receipt < tt_cutoff) %>% 
+  as_tsibble(index = date_receipt) %>% 
+  model(
+    lag2 = ARIMA(log10(incidence) ~ 
+                     1 +
+                     log10(cpp_wtd_med) +
+                     log10(new_tests_per_thousand) +
+                     log10(cpp_wtd_med):p_delta +
+                     pdq(1, 0, 0) +
+                     PDQ(0, 0, 0),
+                   method = "ML", approximation = FALSE),
+  )
+
+laglead$lag1 <- dk %>% 
+  mutate(across(c(incidence, new_tests_per_thousand, p_delta), shift, -1)) %>% 
+  filter_studyperiod() %>% 
+  filter(date_receipt < tt_cutoff) %>% 
+  as_tsibble(index = date_receipt) %>% 
+  model(
+    lag1 = ARIMA(log10(incidence) ~ 
+                     1 +
+                     log10(cpp_wtd_med) +
+                     log10(new_tests_per_thousand) +
+                     log10(cpp_wtd_med):p_delta +
+                     pdq(1, 0, 0) +
+                     PDQ(0, 0, 0),
+                   method = "ML", approximation = FALSE),
+  )
+
+laglead$zero <- dk %>% 
+  filter_studyperiod() %>% 
+  filter(date_receipt < tt_cutoff) %>% 
+  as_tsibble(index = date_receipt) %>% 
+  model(
+    zero = ARIMA(log10(incidence) ~ 
+                     1 +
+                     log10(cpp_wtd_med) +
+                     log10(new_tests_per_thousand) +
+                     log10(cpp_wtd_med):p_delta +
+                     pdq(1, 0, 0) +
+                     PDQ(0, 0, 0),
+                   method = "ML", approximation = FALSE),
+  )
+
+laglead$lead1 <- dk %>% 
+  mutate(across(c(incidence, new_tests_per_thousand, p_delta), shift, 1)) %>% 
+  filter_studyperiod() %>% 
+  filter(date_receipt < tt_cutoff) %>% 
+  as_tsibble(index = date_receipt) %>% 
+  model(
+    lead1 = ARIMA(log10(incidence) ~ 
+                     1 +
+                     log10(cpp_wtd_med) +
+                     log10(new_tests_per_thousand) +
+                     log10(cpp_wtd_med):p_delta +
+                     pdq(1, 0, 0) +
+                     PDQ(0, 0, 0),
+                   method = "ML", approximation = FALSE),
+  )
+
+laglead$lead2 <- dk %>% 
+  mutate(across(c(incidence, new_tests_per_thousand, p_delta), shift, 2)) %>% 
+  filter_studyperiod() %>% 
+  filter(date_receipt < tt_cutoff) %>% 
+  as_tsibble(index = date_receipt) %>% 
+  model(
+    lead2 = ARIMA(log10(incidence) ~ 
+                     1 +
+                     log10(cpp_wtd_med) +
+                     log10(new_tests_per_thousand) +
+                     log10(cpp_wtd_med):p_delta +
+                     pdq(1, 0, 0) +
+                     PDQ(0, 0, 0),
+                   method = "ML", approximation = FALSE),
+  )
+
+laglead %>% 
+  map_df(glance) %>% 
+  select(-c(ar_roots, ma_roots))
+```
+
+The zero lag model is the best one.
+
+
+
+
+
+
+
+
+# Pleje
+
+
+## Pleje model
+
+Check how many tests are being done
+
+```{r}
+# All data series graph
+dk %>% 
+  filter_studyperiod() %>% 
+  select(date_receipt,
+         new_tests_per_thousand,
+         cpp_wtd_med,
+         incidence_general = incidence) %>% 
+  left_join(pleje %>% 
+              transmute(monday,
+                        incidence_pleje = incidence,
+                        tests_pleje = tests / denominator * 1000,
+                        p_pos_pleje = p_pos),
+            by = c("date_receipt" = "monday"),
+            suffix = c("", "_pleje")) %>% 
+  select(date_receipt, new_tests_per_thousand, cpp_wtd_med, incidence_general, incidence_pleje,
+         tests_pleje, p_pos_pleje) %>% 
+  pivot_longer(-date_receipt) %>% 
+  mutate(name = fct_reorder_legend(name, value, date_receipt)) %>% 
+  ggplot(aes(date_receipt, value, colour = name)) +
+  geom_line(linewidth = 1.5) +
+  geom_label(data = ~ group_by(., name) %>% 
+               filter(
+                 value %in% c(min(value),
+                              max(value),
+                              min(value[date_receipt >= ymd("2022-05-01")]))
+               ) %>% 
+               rowwise() %>% 
+               mutate(label = format((value), digits = 2, scientific = FALSE,
+                                     trim = TRUE)) %>% 
+               ungroup(),
+             aes(label = label),
+             show.legend = FALSE) +
+  scale_x_date(date_breaks = "1 month",
+               date_labels = "%b") +
+  scale_y_log10(labels = comma_dk) +
+  theme(axis.text.x = element_text(hjust = 0)) +
+  labs(
+    title = "Data series",
+    x = NULL,
+    y = NULL,
+    colour = NULL
+  )
+```
+
+
+```{r}
+testing_pleje_public <- pleje %>%
+  filter_studyperiod(monday) %>% 
+  mutate(pleje_weekly_tests_per_1000 = tests / denominator * 1000) %>% 
+  inner_join(
+    dk %>% 
+      mutate(weekly_tests_per_1000 = tests / population * 1000) %>% 
+      select(date_receipt, weekly_tests_per_1000),
+    by = c("monday" = "date_receipt")
+  ) %>% 
+  select(monday, pleje_weekly_tests_per_1000, weekly_tests_per_1000) %>% 
+  mutate(pleje_testing_factor = pleje_weekly_tests_per_1000 / weekly_tests_per_1000)
+
+
+
+testing_pleje_public %>% 
+  pivot_longer(c(pleje_weekly_tests_per_1000, weekly_tests_per_1000)) %>% 
+  filter(!is.na(value)) %>% 
+  ggplot(aes(monday, value, colour = name)) +
+  geom_line(linewidth = 1.5) +
+  geom_text(data = ~ filter(., name == "pleje_weekly_tests_per_1000",
+                            !is.na(pleje_testing_factor)) %>% 
+              slice(which(row_number() %% 2 == 0)),
+            aes(label = round(pleje_testing_factor, 1)),
+            nudge_y = -0.2,
+            size = 3,
+            colour = "black") +
+  scale_x_date(date_breaks = "1 month",
+               date_labels = "%b") +
+  scale_y_log10(breaks = scales::log_breaks(10)) +
+  theme(axis.text.x = element_text(hjust = 0)) +
+  labs(
+    title = "Weekly tests over time, pleje and general public",
+    x = NULL,
+    y = "Number of weekly tests per 1,000",
+    colour = NULL
+  )
+
+summary(testing_pleje_public$pleje_testing_factor, digits = 3)
+```
+
+Care personnel had on average `r round(mean(testing_pleje_public$pleje_testing_factor), 2)` times as many tests per 1,000 as the general public, throughout the period.
+
+
+
+```{r}
+pm1 <- train_data %>% 
+  lm(log10(pleje_incidence) ~
+       log10(cpp_wtd_med) +
+       log10(pleje_tests) +
+       log10(cpp_wtd_med):p_delta,
+     data = .)
+
+
+
+
+pm1_augmented <- broom::augment(pm1, train_data, interval = "prediction")
+
+pm1_augmented %>% 
+  ggplot(aes(date_receipt)) +
+  geom_line(aes(y = log10(pleje_incidence),
+                colour = "Observed"),
+            linewidth = 2.5) +
+  geom_point(aes(y = .fitted,
+                 colour = "Predicted"),
+             size = 3) +
+  expand_limits(y = 0) +
+  scale_x_date(date_breaks = "1 month",
+               date_labels = "%b") +
+  scale_colour_manual(breaks = c("Observed", "Predicted"),
+                      values = c("grey85", "darkorange")) +
+  labs(title = "PM1 fit (= WW, pleje tests, delta interaction)",
+       x = NULL,
+       y = "Log % positive",
+       colour = NULL)
+
+
+
+summary(pm1)
+
+
+plot_ts_residuals(pm1_augmented)
+
+
+
+pleje_arimas <- train_data %>% 
+  as_tsibble(index = date_receipt) %>% 
+  model(
+    pm1_000 = ARIMA(log10(pleje_incidence) ~
+                      log10(cpp_wtd_med) +
+                      log10(pleje_tests) +
+                      log10(cpp_wtd_med):p_delta +
+                      pdq(0, 0, 0),
+                    method = "ML",
+                    approximation = FALSE),
+    pm1_100 = ARIMA(log10(pleje_incidence) ~
+                      log10(cpp_wtd_med) +
+                      log10(pleje_tests) +
+                      log10(cpp_wtd_med):p_delta +
+                      pdq(1, 0, 0),
+                    method = "ML",
+                    approximation = FALSE),
+  )
+
+glance(pleje_arimas) %>% 
+  select(-c(ar_roots, ma_roots))
+
+
+pleje_arimas %>% 
+  broom::tidy() %>% 
+  select(-statistic) %>% 
+  mutate(across(estimate:std.error,
+                round, 2))
+
+
+
+pleje_sigma2s_arima <- pleje_arimas %>% 
+  glance(fit) %>% 
+  select(.model, sigma2)
+
+pleje_arimas %>% 
+  broom::augment() %>% 
+  left_join(pleje_sigma2s_arima, by = ".model") %>% 
+  ggplot(aes(date_receipt)) +
+  geom_line(data = ~ distinct(., date_receipt, pleje_incidence),
+            aes(y = pleje_incidence,
+                colour = "Observed"),
+            linewidth = 3) +
+  geom_line(aes(y = .fitted,
+                 colour = .model),
+             linewidth = 1.3,
+            alpha = 0.75) +
+  scale_x_date(date_breaks = "1 month",
+               date_labels = "%b") +
+  scale_y_log10() +
+  scale_colour_manual(aesthetics = c("colour", "fill"),
+                      values = c("grey85",
+                                 "grey30",
+                                 "forestgreen"),
+                      breaks = c("Observed",
+                                 "pm1_000",
+                                 "pm1_100")) +
+  guides(shape = "none",
+         fill = "none") +
+  labs(title = "Pleje models",
+       colour = NULL,
+       fill = NULL,
+       x = NULL,
+       y = "Log % positive")
+
+
+```
+
+
+
+
+### Pleje forecast
+
+```{r}
+trained_pleje <- train_data %>% 
+  as_tsibble(index = date_receipt) %>% 
+  # mutate(across(c(incidence,
+  #                 pleje_p_pos, 
+  #                 cpp_wtd_med, 
+  #                 new_tests_per_thousand),
+  #               log10)) %>% 
+  model(
+    pm1_000 = ARIMA(log10(pleje_incidence) ~
+                      log10(cpp_wtd_med) +
+                      log10(cpp_wtd_med):p_delta +
+                      log10(pleje_tests) +
+                      pdq(0, 0, 0),
+                    method = "ML",
+                    approximation = FALSE),
+    pm1_100 = ARIMA(log10(pleje_incidence) ~
+                      log10(cpp_wtd_med) +
+                      log10(cpp_wtd_med):p_delta +
+                      log10(pleje_tests) +
+                      pdq(1, 0, 0),
+                    method = "ML",
+                    approximation = FALSE),
+  )
+
+glance(trained_pleje)
+trained_pleje %>% tidy()
+```
+
+
+```{r}
+
+trained_pleje %>% 
+  select(pm1_100) %>%
+  forecast(test_data) %>%
+  hilo(level = 95) %>% 
+  rename(conf = "95%") %>% 
+  unpack_hilo(cols = conf) %>% 
+  relocate(.mean, conf_lower, conf_upper,
+           .after = date_receipt) %>% 
+  ggplot(aes(date_receipt)) +
+  geom_vline(xintercept = ymd("2022-01-01"), colour = "grey80") +
+  geom_line(data = dk %>% 
+              filter_studyperiod(),
+            aes(y = pleje_incidence,
+                colour = "Observed"),
+            linewidth = 2) +
+  geom_ribbon(aes(ymin = conf_lower,
+                  ymax = conf_upper),
+              fill = "purple",
+              alpha = 0.2) +
+  geom_line(aes(y = .mean,
+                colour = "Validation (95%\nprediction interval)"),
+            linewidth = 1.5) +
+  geom_line(data = trained_pleje %>% 
+              select(pm1_100) %>% 
+              augment(),
+            aes(y = .fitted,
+                colour = "Model fit"),
+            linewidth = 1.5) +
+  scale_x_date(date_breaks = "1 month",
+               labels = label_month_first_year()) +
+  scale_y_log10(labels = scales::label_comma(),
+                breaks = scales::breaks_log(6)) +
+  expand_limits(y = c(30, 10000)) +
+  scale_colour_manual(breaks = c("Observed",
+                                 "Model fit",
+                                 "Validation (95%\nprediction interval)"),
+                      values = c("black",
+                                 "darkorange",
+                                 "purple")) +
+  theme(axis.text.x = element_text(hjust = 0)) +
+  labs(
+    title = NULL,
+    x = NULL,
+    y = "Care personnel incidence per 100,000",
+    colour = NULL,
+    fill = NULL
+  )
+
+
+ggsave(here("paper/figures/Figure 2B.pdf"),
+       width = 5,
+       height = 2,
+       units = "in",
+       dpi = 300,
+       scale = 1.6)
+```
+
+
+
+
+
+# Regional
+
+## Descriptive
+
+
+Regional time series comparison
+
+```{r}
+
+# Plot the time series together. I don't understand, WW clearly matches
+# incidence quite well, why does it come out of the model so badly?
+regional_weekly %>%
+  select(region, date_receipt, cpp_wtd_med, new_tests_per_thousand, incidence) %>%
+  pivot_longer(cpp_wtd_med:incidence) %>%
+  ggplot(aes(date_receipt, value, group = name)) +
+  facet_wrap(~ region) +
+  geom_line(aes(colour = name), linewidth = 1.5) +
+  scale_y_log10()
+
+
+```
+
+
+
+Graph of regional incidence over time
+
+```{r}
+regional_human %>%
+  filter_studyperiod(monday) %>% 
+  mutate(region = recode(region, !!!geogs$regioner_english)) %>% 
+  ggplot(aes(monday, incidence, colour = region)) +
+  geom_vline(xintercept = ymd("2022-01-01"), colour = "grey80") +
+  geom_line(linewidth = 1) +
+  scale_x_date(date_breaks = "1 month",
+               labels = label_month_first_year()) +
+  scale_y_log10(labels = scales::label_comma(),
+                breaks = scales::breaks_log(6)) +
+  scale_colour_few() +
+  theme(axis.text.x = element_text(hjust = 0)) +
+  labs(
+    title = NULL,
+    x = NULL,
+    y = "Weekly incidence per 100k",
+    colour = NULL
+  )
+
+ggsave(here(glue("paper/figures/Appendix Figure C regional incidence.pdf")),
+       width = 5,
+       height = 2,
+       units = "in",
+       dpi = 300,
+       scale = 1.6)
+```
+
+
+Testing rate over time by region
+
+```{r}
+regional_human %>%
+  filter_studyperiod(monday) %>% 
+  mutate(region = recode(region, !!!geogs$regioner_english)) %>% 
+  ggplot(aes(monday, new_tests_per_thousand, colour = region)) +
+  geom_vline(xintercept = ymd("2022-01-01"), colour = "grey80") +
+  geom_line(linewidth = 1) +
+  scale_x_date(date_breaks = "1 month",
+               labels = label_month_first_year()) +
+  scale_y_log10(labels = scales::label_comma(),
+                breaks = scales::breaks_log(6)) +
+  scale_colour_few() +
+  theme(axis.text.x = element_text(hjust = 0)) +
+  labs(
+    x = NULL,
+    y = "Weekly tests per 1,000",
+    colour = NULL
+  )
+
+ggsave(here(glue("paper/figures/Appendix Figure D regional testing rate.pdf")),
+       width = 5,
+       height = 2,
+       units = "in",
+       dpi = 300,
+       scale = 1.6)
+```
+
+
+
+Graph of WWTP enrolment by region
+
+```{r}
+ww_human %>%
+  filter(!is.na(rna_mean),
+         date_receipt >= ymd("2021-09-06"),
+         date_receipt <= ymd("2021-12-31"),
+         overlap_level == "1. anlæg") %>%
+  group_by(region, monday = floor_monday(date_receipt)) %>%
+  summarise(n_anlaeg = n_distinct(anlaeg_rando),
+            .groups = "drop") %>%
+  ggplot(aes(monday, n_anlaeg, fill = monday >= ymd("2021-09-27"))) +
+  geom_col() +
+  guides(fill = "none") +
+  facet_wrap(~ region) +
+  labs(title = "Enrolment of WWTPs by region")
+
+```
+
+Note: some of these WWTPs might not be included in this analysis dataset.
+
+
+Numbers of samples per region
+
+```{r}
+ww_human %>% 
+  filter_analysis() %>% 
+  group_by(region) %>% 
+  summarise(n_anlaeg = n_distinct(anlaeg_rando),
+            n_samples = n()) %>% 
+  janitor::adorn_totals("row")
+```
+
+
+
+```{r}
+# WW vs incidence scatter
+regional_weekly %>%
+  ggplot(aes(cpp_wtd_med, incidence)) +
+  geom_point(aes(colour = region, shape = region),
+             size = 2.5) +
+  # geom_path(aes(group = region, colour = region)) +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(title = "WW vs incidence, by region",
+       colour = NULL,
+       shape = NULL)
+```
+
+
+
+
+## ARIMA
+
+
+Train models
+
+```{r}
+regional_arimas <- train_regional %>%
+  mutate(one = 1) %>% 
+  model(
+    rm4_000 = ARIMA(log10(incidence) ~
+                      log10(cpp_wtd_med) +
+                      log10(new_tests_per_thousand) +
+                      log10(cpp_wtd_med):p_delta +
+                      pdq(0, 0, 0),
+                    method = "ML"),
+    rm4_100 = ARIMA(log10(incidence) ~
+                      log10(cpp_wtd_med) +
+                      log10(new_tests_per_thousand) +
+                      log10(cpp_wtd_med):p_delta +
+                      1 +
+                      pdq(1, 0, 0),
+                    method = "ML")
+  )
+```
+
+
+Performance of AR(1) vs linear models
+
+```{r}
+regional_arimas %>%
+  glance() %>% 
+  select(-c(ma_roots, ar_roots)) %>%
+  mutate(across(log_lik:BIC, round, 1))
+```
+
+
+
+Estimates from models
+
+```{r}
+estimates_regional_arimas <- regional_arimas %>%
+  # select(rm4_100) %>%
+  tidy() %>%
+  mutate(ci_lo = estimate - 2 * std.error,
+         ci_hi = estimate + 2 * std.error)
+
+estimates_regional_arimas %>% 
+  select(-statistic) %>% 
+  mutate(across(where(is.numeric) & !p.value, round, 2),
+         across(p.value, round, 3)) %>% 
+  arrange(.model, region)
+```
+
+
+```{r}
+# WW parameters from the AR(1) version of RM4.
+estimates_regional_arimas %>%
+  filter(.model == "rm4_100") %>%
+  filter(term == "log10(cpp_wtd_med)") %>%
+  ggplot(aes(estimate, region)) +
+  geom_vline(xintercept = c(0, 1)) +
+  geom_linerange(aes(xmin = ci_lo,
+                     xmax = ci_hi)) +
+  geom_point(aes(size = 1 / std.error), shape = 15, show.legend = FALSE)
+
+```
+
+
+
+
+```{r}
+combined_estimate <- function(mable, terms) {
+  assert_that(length(mable) == 1)
+  
+  mable %>% 
+    pull() %>% 
+    pluck(1, "fit", "par") %>% 
+    filter(term %in% terms) %>% 
+    pull(estimate) %>% 
+    sum()
+}
+
+
+combined_se <- function(mable, terms) {
+  assert_that(length(mable) == 1)
+  
+  vc <- mable %>% 
+    pull() %>% 
+    pluck(1, "fit", "model", "var.coef")
+  
+  x <- (rownames(vc) %in% terms) %>% 
+    as.numeric() %>% 
+    matrix(ncol = 1)
+  
+  sd_combination <- sqrt(t(x) %*% vc %*% x) %>% as.numeric()
+  
+  return(sd_combination)
+}
+
+# arimas %>% 
+#   select(m5_100) %>% 
+#   combined_se(c("log10(cpp_wtd_med)", "log10(cpp_wtd_med):p_delta"))
+# 
+# 
+# arimas %>% 
+#   select(m5_100) %>% 
+#   combined_estimate("log10(cpp_wtd_med)")
+# 
+
+
+combined_tidy <- function(mable, terms) {
+  assert_that(length(mable) == 1)
+  
+  est <- combined_estimate(mable, terms)
+  se <- combined_se(mable, terms)
+  
+  tibble(term = paste(terms, collapse = " + "),
+         estimate = est,
+         std.error = se,
+         conf.low = est - 2 * se,
+         conf.high = est + 2 * se)
+}
+```
+
+
+National model Delta estimate
+
+```{r}
+arimas %>%
+  select(m5_100) %>%
+  combined_tidy(terms = c("log10(cpp_wtd_med)", "log10(cpp_wtd_med):p_delta"))
+```
+
+
+Care personnel model Delta estimate
+
+```{r}
+pleje_arimas %>%
+  select(pm1_100) %>%
+  combined_tidy(terms = c("log10(cpp_wtd_med)", "log10(cpp_wtd_med):p_delta"))
+```
+
+
+Regional model Delta estimates
+
+```{r}
+regional_arimas %>% 
+  select(rm4_100) %>% 
+  rowwise() %>% 
+  mutate(interaction = list(combined_tidy(tibble(list(rm4_100)),
+                                          c("log10(cpp_wtd_med)",
+                                            "log10(cpp_wtd_med):p_delta")))) %>%
+  unnest(interaction) %>% 
+  print() %>% 
+  ggplot(aes(estimate, region)) +
+  geom_vline(xintercept = c(0, 1)) +
+  geom_point(aes(size = 1 / std.error), shape = 15, show.legend = FALSE) +
+  geom_errorbar(aes(xmin = conf.low,
+                    xmax = conf.high), width = 0)
+```
+
+
+
+
+
+Lasse's cov2cor explanation of why Hovedstaden has low WW parameter. Except now all of a sudden the correlation isn't that high anymore.
+
+```{r}
+
+# cov2cor(
+#   (regional_arimas %>% select(rm4_100) %>%
+#       filter(region == "Hovedstaden")
+#   )[[2]][[1]][["fit"]][["model"]][["var.coef"]]
+# )
+
+
+
+pluck_var.coef <- function(x) {
+  assert_that(fabletools::is_mable(x),
+              ncol(x) == 1)
+  
+  x[[1]][[1]][["fit"]][["model"]][["var.coef"]]
+}
+
+
+
+
+
+trained_arimas %>% 
+  select(m5_100) %>% 
+  pluck_var.coef() %>% 
+  cov2cor() %>% 
+  round(2) %>% 
+  .["log10(new_tests_per_thousand)", "log10(cpp_wtd_med)"]
+
+regional_arimas %>% 
+  filter(region == "Capital Region") %>% 
+  select(rm4_100) %>% 
+  pluck_var.coef() %>% 
+  cov2cor() %>% 
+  round(2) %>% 
+  .["log10(new_tests_per_thousand)", "log10(cpp_wtd_med)"]
+regional_arimas %>% 
+  filter(region == "Central Denmark") %>% 
+  select(rm4_100) %>% 
+  pluck_var.coef() %>% 
+  cov2cor() %>% 
+  round(2) %>% 
+  .["log10(new_tests_per_thousand)", "log10(cpp_wtd_med)"]
+regional_arimas %>% 
+  filter(region == "Zealand") %>% 
+  select(rm4_100) %>% 
+  pluck_var.coef() %>% 
+  cov2cor() %>% 
+  round(2) %>% 
+  .["log10(new_tests_per_thousand)", "log10(cpp_wtd_med)"]
+regional_arimas %>% 
+  filter(region == "Southern Denmark") %>% 
+  select(rm4_100) %>% 
+  pluck_var.coef() %>% 
+  cov2cor() %>% 
+  round(2) %>% 
+  .["log10(new_tests_per_thousand)", "log10(cpp_wtd_med)"]
+regional_arimas %>% 
+  filter(region == "North Denmark") %>% 
+  select(rm4_100) %>% 
+  pluck_var.coef() %>% 
+  cov2cor() %>% 
+  round(2) %>% 
+  .["log10(new_tests_per_thousand)", "log10(cpp_wtd_med)"]
+```
+
+
+
+
+
+```{r}
+# Save regional appendix figures
+
+regional_forecasts <- regional_arimas %>% 
+  select(rm4_100) %>% 
+  forecast(test_regional) %>% 
+  hilo(level = 95) %>% 
+  rename(conf = "95%") %>% 
+  unpack_hilo(cols = conf) %>% 
+  relocate(.mean, conf_lower, conf_upper,
+           .after = date_receipt)
+
+for (region in unique(regional_forecasts$region)) {
+  
+  regional_forecasts %>% 
+    filter(region == {{region}}) %>% 
+    ggplot(aes(date_receipt)) +
+    geom_vline(xintercept = ymd("2022-01-01"), colour = "grey80") +
+    geom_line(data = regional_weekly %>% 
+                filter_studyperiod() %>% 
+                filter(region == {{region}}),
+              aes(y = incidence,
+                  colour = "Observed"),
+              linewidth = 2) +
+    geom_ribbon(aes(ymin = conf_lower,
+                    ymax = conf_upper),
+                fill = "purple",
+                alpha = 0.2) +
+    geom_line(aes(y = .mean,
+                  colour = "Validation (95%\nprediction interval)"),
+              linewidth = 1.5) +
+    geom_line(data = regional_arimas %>% 
+                select(rm4_100) %>% 
+                augment() %>% 
+                filter(region == {{region}}),
+              aes(y = .fitted,
+                  colour = "Model fit"),
+              linewidth = 1.5) +
+    scale_x_date(date_breaks = "1 month",
+                 labels = label_month_first_year()) +
+    scale_y_log10(labels = scales::label_comma(),
+                  breaks = scales::breaks_log(6)) +
+    expand_limits(y = c(25, 10000)) +
+    scale_colour_manual(breaks = c("Observed",
+                                   "Model fit",
+                                   "Validation (95%\nprediction interval)"),
+                        values = c("black",
+                                   "darkorange",
+                                   "purple")) +
+    theme(axis.text.x = element_text(hjust = 0)) +
+    labs(
+      title = NULL,
+      x = NULL,
+      y = "Incidence per 100,000",
+      colour = NULL,
+      fill = NULL
+    )
+  
+  
+  ggsave(here(glue("paper/figures/Appendix Figure F - {region}.pdf")),
+         width = 5,
+         height = 2,
+         units = "in",
+         dpi = 300,
+         scale = 1.6)
+  
+}
+```
+
+
+
+
+
+
+# Forecast accuracy
+
+```{r}
+observed_pi_national <- trained_arimas %>% 
+  select(m5_100) %>% 
+  forecast(test_data) %>% 
+  hilo(level = 95) %>% 
+  mutate(.model = "National") %>% 
+  rename(conf = "95%") %>% 
+  unpack_hilo(cols = conf) %>% 
+  relocate(.mean, conf_lower, conf_upper,
+           .after = date_receipt) %>% 
+  select(.model, date_receipt, conf_lower, conf_upper) %>% 
+  left_join(dk %>% 
+              filter_studyperiod() %>% 
+              select(date_receipt, observed = incidence),
+            by = "date_receipt") 
+
+
+observed_pi_pleje <- trained_pleje %>% 
+  select(pm1_100) %>%
+  forecast(test_data) %>%
+  hilo(level = 95) %>% 
+  mutate(.model = "Care personnel") %>% 
+  rename(conf = "95%") %>% 
+  unpack_hilo(cols = conf) %>% 
+  relocate(.mean, conf_lower, conf_upper,
+           .after = date_receipt) %>% 
+  select(.model, date_receipt, conf_lower, conf_upper) %>% 
+  left_join(dk %>% 
+              filter_studyperiod() %>% 
+              select(date_receipt, observed = pleje_incidence),
+            by = "date_receipt") 
+
+
+
+
+observed_pi_regional <- regional_forecasts %>% 
+  mutate(.model = "Regional") %>% 
+  select(.model, region, date_receipt, conf_lower, conf_upper) %>% 
+  left_join(regional_weekly %>% 
+              filter_studyperiod() %>% 
+              select(region, date_receipt, observed = incidence),
+            by = c("region", "date_receipt"))
+
+
+
+
+observed_pi <- bind_rows(observed_pi_national %>% as_tibble(),
+          observed_pi_pleje %>% as_tibble(),
+          observed_pi_regional %>% as_tibble()) %>% 
+  mutate(in_ci = observed %>% between(conf_lower, conf_upper)) %>% 
+  group_by(.model, region) %>% 
+  summarise(n = sum(in_ci),
+            N = n(),
+            p_in_ci = scales::percent(n / N, 1),
+            .groups = "drop") %>% 
+  select(.model, region, p_in_ci)
+```
+
+
+
+```{r}
+
+bind_rows(
+  trained_arimas %>% 
+    select(National = m5_100) %>% 
+    forecast(test_data) %>% 
+    accuracy(data = test_data),
+  
+  pleje_arimas %>% 
+    select("Care personnel" = pm1_100) %>% 
+    forecast(test_data) %>% 
+    accuracy(test_data),
+  
+  regional_arimas %>% 
+    select(Regional = rm4_100) %>% 
+    forecast(test_regional) %>% 
+    accuracy(test_regional)
+  
+) %>% 
+  left_join(observed_pi, by = c(".model", "region")) %>% 
+  select(-c(MASE, RMSSE, .type)) %>% 
+  rename(Model = .model,
+         "PI coverage" = p_in_ci) %>% 
+  relocate(Region = region, .after = Model) %>% 
+  mutate(Region = coalesce(Region, "–"),
+         across(where(is.numeric), round, 1)) %>% 
+  gt::gt()
+```
+
+
+
+
+
+
+
+
+
+# Stable tests
+
+If we're thinking about substituting human tests, then we want to look at what the wastewater data suggests we would see at a constant level of human testing.
+
+We make predictions using our model on real wastewater data. But we fix the human testing at a constant level. That way, we hope we will see what the observed incidence would have been if we had always tested at that level. Here, I'm using the highest-ever testing rate.
+
+```{r}
+dk %>% 
+  filter_studyperiod() %>% 
+  filter(new_tests_per_thousand == max(new_tests_per_thousand)) %>% 
+  select(date_receipt, new_tests_per_thousand)
+
+m5_augmented_constant_test <- arimas %>% 
+  select(m5_100) %>% 
+  refit(dk %>%
+          filter_studyperiod() %>% 
+          as_tsibble(index = date_receipt) %>% 
+          mutate(new_tests_per_thousand = max(new_tests_per_thousand))) %>% 
+  augment() %>% 
+  left_join(sigma2s_arima, by = ".model") %>% 
+  mutate(conf_lower = 10^(log10(.fitted) - 2 * sqrt(sigma2)),
+         conf_upper = 10^(log10(.fitted) + 2 * sqrt(sigma2)))
+
+m5_augmented_constant_test %>% 
+  ggplot(aes(date_receipt)) +
+  geom_vline(xintercept = ymd("2022-01-01"), colour = "grey80") +
+  geom_line(aes(y = incidence,
+                colour = "Observed"),
+            linewidth = 2) +
+  geom_ribbon(aes(ymin = conf_lower,
+                  ymax = conf_upper,
+                  fill = "Prediction"),
+              alpha = 0.2) +
+  geom_line(aes(y = .fitted,
+                colour = "Prediction"),
+            linewidth = 1.5) +
+  scale_x_date(date_breaks = "1 month",
+               labels = label_month_first_year()) +
+  scale_y_log10(labels = scales::label_comma(),
+                breaks = scales::breaks_log(6)) +
+  expand_limits(y = c(30, 10000)) +
+  scale_colour_manual(breaks = c("Observed",
+                                 "Prediction"),
+                      labels = c("Observed",
+                                 "Prediction (95%\nprediction interval)"),
+                      values = c("black",
+                                 "purple"),
+                      aesthetics = c("colour", "fill")) +
+  guides(fill = "none") +
+  theme(axis.text.x = element_text(hjust = 0)) +
+  labs(
+    x = NULL,
+    y = "Incidence per 100,000",
+    colour = NULL
+  )
+
+
+ggsave(here("paper/figures/Figure 3.pdf"),
+       width = 5,
+       height = 2,
+       units = "in",
+       dpi = 300,
+       scale = 1.6)
+```
+
+
+## Underreporting
+
+% of cases reported
+
+```{r}
+m5_augmented_constant_test %>% 
+  mutate(reporting = incidence / .fitted) %>% 
+  select(date_receipt, reporting) %>% 
+  ggplot(aes(date_receipt, reporting)) +
+  geom_vline(xintercept = ymd("2022-01-01"), colour = "grey80") +
+  geom_line(linewidth = 2) +
+  expand_limits(y = c(0, 1)) +
+  geom_hline(yintercept = c(0, 1)) +
+  scale_x_date(date_breaks = "1 month",
+               labels = label_month_first_year()) +
+  scale_y_continuous(labels = scales::label_percent(),
+                     breaks = seq(0, 1, 0.2)) +
+  
+  theme(panel.grid.minor.y = element_line(),
+        axis.text.x = element_text(hjust = 0)) +
+  labs(title = "Percentage of estimated cases reported over time",
+       y = "% reported",
+       x = NULL)
+```
+
+
+Factor of cases that weren't reported
+
+```{r}
+m5_augmented_constant_test %>% 
+  mutate(underrreporting = .fitted / incidence) %>% 
+  ggplot(aes(date_receipt, underrreporting)) +
+  geom_hline(yintercept = 1) +
+  geom_line(linewidth = 2) +
+  scale_x_date(date_breaks = "1 month",
+               labels = label_month_first_year()) +
+  scale_y_continuous(breaks = seq(0, 10, 1),
+                     labels = scales::label_number(suffix = "\u00D7")) +
+  theme(axis.text.x = element_text(hjust = 0),
+        axis.text.y = element_text(vjust = 0.4)) +
+  labs(
+    title = "Estimated underreporting of cases over time",
+    subtitle = "E.g. 2\u00D7 means we estimate twice as many real cases as were reported",
+    x = NULL,
+    y = "Estimated underreporting factor"
+  )
+```
+
+
+
+
+
+
+
+
+
+
+
+
+# Writing
+
+
+Model selection numbers for appendix
+
+```{r}
+arimas %>% 
+  select(-ar1) %>%
+  glance() %>% 
+  mutate(.model = str_extract(.model, "\\d")) %>% 
+  select(Model = .model,
+         "Log-likelihood" = log_lik,
+         AIC,
+         BIC)
+```
+
+
+
+
+Table with all the model estimates
+
+```{r}
+arimas %>% 
+  select(m5_100) %>% 
+  tidy() %>% 
+  bind_rows(
+    pleje_arimas %>% 
+      select(pm1_100) %>% 
+      tidy()
+  ) %>% 
+  bind_rows(
+    regional_arimas %>% 
+      select(rm4_100) %>% 
+      tidy()
+  ) %>% 
+  select(-statistic) %>% 
+  mutate(
+    conf.low = estimate - 2 * std.error,
+    conf.high = estimate + 2 * std.error,
+    across(where(is.numeric) & !p.value, round, 2),
+    ci = glue("({conf.low} to {conf.high})",
+              conf.low = format(conf.low %>% 
+                                  round(2),
+                                digits = 1,
+                                nsmall = 2,
+                                trim = TRUE),
+              conf.high = format(conf.high %>% 
+                                   round(2),
+                                 digits = 1,
+                                 nsmall = 2,
+                                 trim = TRUE)),
+    .model = recode(.model,
+                    "m5_100" = "National",
+                    "pm1_100" = "Care personnel",
+                    "rm4_100" = "Regional"),
+    term = recode(
+      term,
+      "ar1" = "AR(1)",
+      "log10(cpp_wtd_med)" = "Wastewater concentration",
+      "log10(new_tests_per_thousand)" = "Testing rate",
+      "log10(cpp_wtd_med):p_delta" = "Wastewater concentration * Delta (%)"
+    ),
+    p.value = gtsummary::style_pvalue(p.value),
+    region = coalesce(region, "")
+  ) %>%
+  select(-c(conf.low, conf.high)) %>% 
+  relocate(region, .after = .model) %>% 
+  relocate(ci, .after = estimate) %>% 
+  group_by(.model) %>% 
+  gt::gt(rowname_col = "region")
+```
+
+```{r}
+writing <- list()
+
+writing$n_samples <- dk %>%
+  filter_studyperiod() %>% 
+  pull(n_samples) %>% 
+  sum()
+
+writing$n_wwtp <- ww_human %>% 
+  filter_analysis() %>% 
+  pull(anlaeg_rando) %>% 
+  n_distinct()
+
+writing$n_flow_prop <- ww_human %>% 
+  filter_analysis() %>% 
+  filter(proevetagnings_metode == "Mgd.prop.") %>% 
+  nrow()
+
+writing$n_time_prop <- ww_human %>% 
+  filter_analysis() %>% 
+  filter(proevetagnings_metode == "Tid.prop.") %>% 
+  nrow()
+
+writing$n_weeks <- dk %>% 
+  filter_studyperiod() %>% 
+  nrow()
+
+writing$median_weekly_samples <- median(dk$n_samples, na.rm = TRUE)
+writing$iqr_weekly_samples <- glue("{low} - {high}",
+                                   low = quantile(dk$n_samples, 0.25, na.rm = TRUE),
+                                   high = quantile(dk$n_samples, 0.75, na.rm = TRUE))
+
+# Number of samples excluded due to extreme values of faecal indicators. This
+# runs only if we've run the cleaning file. It gives 96 though.
+# std_out %>% filter(date_receipt <= ymd("2022-06-26")) %>% nrow()
+
+
+writing$initial_n_samples <- ww_human %>%
+  filter_studyperiod() %>% 
+  filter(!is.na(rna_mean),
+         overlap_level == "1. anlæg") %>% 
+  nrow()
+
+
+
+
+# Exclusions
+
+# filter_analysis <- function(df, log = FALSE) {
+#   
+#   filter2 <- if (log) tidylog::filter else dplyr::filter
+#   
+#   if (log) print(nrow(df))
+#   
+#   df <- df %>% 
+#     filter_studyperiod() %>% 
+#     filter(!is.na(rna_mean),
+#            overlap_level == "1. anlæg")
+#   
+#   if (log) print(nrow(df))
+#   
+#   df %>% 
+#     filter2(!is.na(population)) %>% 
+#     filter2(wday(date_receipt, week_start = 1) %in% c(2, 3, 5)) %>% 
+#     filter2(!is.na(flow)) %>% 
+#     # Get rid of non-Tue/Wed/Fri WW measurements
+#     filter2(proevetagnings_metode %in% c("Mgd.prop.",
+#                                         "Tid.prop."))
+# }
+
+ww_human %>% 
+  filter_analysis(log = TRUE) %>% 
+  invisible()
+
+
+```
+
+
+We included `r writing$n_samples` wastewater samples from `r writing$n_wwtp` WWTPs, from 27 September 2021 to 26 June 2022. More details on individual WWTPs are listed in appendix Table A.1. Our initial dataset included `r writing$initial_n_samples` samples, of which we excluded `r writing$initial_n_samples - writing$n_samples` (XX because of extreme concentrations of faecal indicators; XX because they were from WWTPs with unknown populations; XX because data was missing on the flow of wastewater in the sampling period; XX because they arrived on unexpected days of the week; and XX because the sampling method was not listed as flow-proportional or time-proportional). Of the included samples, `r writing$n_flow_prop` were flow-proportional and `r writing$n_time_prop` were time-proportional.
+
+After collapsing by week, we had `r writing$n_weeks` wastewater data points. The median number of weekly samples was `r writing$median_weekly_samples` (IQR `r writing$iqr_weekly_samples`)
+
+
+
+
+
+```{r}
+sessioninfo::session_info() %>%
+  details::details(summary = "Current session info")
+```
+
+
+
+
+
+
+```{css, echo = FALSE}
+table {
+    font-variant-numeric: lining-nums tabular-nums;
+    font-size: 90%;
+}
+
+::selection {
+  background: #c9deff;
+}
+pre {
+  display: inline-block
+}
+iframe {
+  border-style: none;
+}
+.table {
+  width: auto;
+  min-width: 30%
+}
+```
+
+

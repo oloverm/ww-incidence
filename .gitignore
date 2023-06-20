@@ -1,0 +1,20 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+.Rdata
+.httr-oauth
+.DS_Store
+Paper/
+R 2022-09/
+R 2022-09.zip
+*.html
+*.RData
+*.rds
+R/kalibrering-app/
+R/wip/
+R/archive/
+R/R test setup/
+R/one-off/
+R/ww-omicron.R
+R/00-01_run-omicron.R
