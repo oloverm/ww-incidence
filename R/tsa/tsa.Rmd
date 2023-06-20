@@ -155,6 +155,9 @@ Read data
 
 ```{r read_data}
 load(here("R/tsa/tsa_data.RData"))
+
+# This is the version with the fix for the weird lab error - just overwrites
+# (some of?) the data above
 load(here("R/tsa/2023-04-21 1343.RData"))
 ```
 
@@ -587,7 +590,7 @@ The mean number of weekly samples was `r round(mean(dk$n_samples), 1)`.
 
 ## Temperature
 
-```{r}
+```{r warning=FALSE}
 ww_human %>%
   filter_analysis() %>% 
   transmute(date_receipt = floor_date(date_receipt, "week", week_start = 1),

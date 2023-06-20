@@ -1,3 +1,5 @@
+# Figures for the presentation at ESCAIDE
+
 fig_ts_presentation <- function(df) {
   df %>%
     ggplot(aes(date_receipt, value, colour = measure)) +

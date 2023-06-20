@@ -1,4 +1,4 @@
-
+# Saving all the bits of data to be able to run the analysis after leaving SSI.
 
 # Read from scratch
 read_ww(cache_limit = days(7))
